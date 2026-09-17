@@ -1,0 +1,2583 @@
+diff --git a/zscaler/oneapiclient.go b/zscaler/oneapiclient.go
+index d2fa220..205253d 100644
+--- a/zscaler/oneapiclient.go
++++ b/zscaler/oneapiclient.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/zscaler/zscaler-sdk-go/v3/cache"
+ 	"github.com/zscaler/zscaler-sdk-go/v3/logger"
+ 	rl "github.com/zscaler/zscaler-sdk-go/v3/ratelimiter"
++	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/remotesign"
+ 	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/zcc"
+ 	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/zdx"
+ 	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/zia"
+@@ -49,6 +50,7 @@ const (
+ 	ZSCALER_VANITY_DOMAIN = "ZSCALER_VANITY_DOMAIN"
+ 	ZSCALER_PRIVATE_KEY   = "ZSCALER_PRIVATE_KEY"
+ 	ZSCALER_CLOUD         = "ZSCALER_CLOUD"
++	ZSCALER_SIGNING_URL   = "ZSCALER_SIGNING_URL"
+ )
+ 
+ // AuthToken represents the OAuth2 authentication token and its expiration time.
+@@ -96,7 +98,32 @@ type Configuration struct {
+ 			AccessToken   *AuthToken `yaml:"accessToken"`
+ 			SandboxToken  string     `yaml:"sandboxToken" envconfig:"ZSCALER_SANDBOX_TOKEN"`
+ 			SandboxCloud  string     `yaml:"sandboxCloud" envconfig:"ZSCALER_SANDBOX_CLOUD"`
+-			Cache         struct {
++			// Signing delegates the client assertion signature to a remote
++			// signing service (Vault Transit, a KMS, any HTTP endpoint) so that
++			// the private key never has to be exportable. It is an alternative
++			// to PrivateKey, not a complement to it.
++			Signing struct {
++				URL            string            `yaml:"url" envconfig:"ZSCALER_SIGNING_URL"`
++				Mode           string            `yaml:"mode" envconfig:"ZSCALER_SIGNING_MODE"`
++				KeyID          string            `yaml:"keyId" envconfig:"ZSCALER_SIGNING_KEY_ID"`
++				Token          string            `yaml:"token" envconfig:"ZSCALER_SIGNING_TOKEN"`
++				AuthMethod     string            `yaml:"authMethod" envconfig:"ZSCALER_SIGNING_AUTH_METHOD"`
++				AuthMount      string            `yaml:"authMount" envconfig:"ZSCALER_SIGNING_AUTH_MOUNT"`
++				Role           string            `yaml:"role" envconfig:"ZSCALER_SIGNING_ROLE"`
++				JWT            string            `yaml:"jwt" envconfig:"ZSCALER_SIGNING_JWT"`
++				JWTTokenFile   string            `yaml:"jwtTokenFile" envconfig:"ZSCALER_SIGNING_JWT_TOKEN_FILE"`
++				RoleID         string            `yaml:"roleId" envconfig:"ZSCALER_SIGNING_ROLE_ID"`
++				SecretID       string            `yaml:"secretId" envconfig:"ZSCALER_SIGNING_SECRET_ID"`
++				Namespace      string            `yaml:"namespace" envconfig:"ZSCALER_SIGNING_NAMESPACE"`
++				KeyVersion     int               `yaml:"keyVersion" envconfig:"ZSCALER_SIGNING_KEY_VERSION"`
++				VaultAddress   string            `yaml:"vaultAddress" envconfig:"ZSCALER_SIGNING_VAULT_ADDRESS"`
++				RequestFormat  string            `yaml:"requestFormat" envconfig:"ZSCALER_SIGNING_REQUEST_FORMAT"`
++				ResponseFormat string            `yaml:"responseFormat" envconfig:"ZSCALER_SIGNING_RESPONSE_FORMAT"`
++				SignatureField string            `yaml:"signatureField" envconfig:"ZSCALER_SIGNING_SIGNATURE_FIELD"`
++				Headers        map[string]string `yaml:"headers" envconfig:"ZSCALER_SIGNING_HEADERS"`
++				RequestTimeout time.Duration     `yaml:"requestTimeout" envconfig:"ZSCALER_SIGNING_REQUEST_TIMEOUT"`
++			} `yaml:"signing"`
++			Cache struct {
+ 				Enabled               bool          `yaml:"enabled" envconfig:"ZSCALER_CLIENT_CACHE_ENABLED"`
+ 				DefaultTtl            time.Duration `yaml:"defaultTtl" envconfig:"ZSCALER_CLIENT_CACHE_DEFAULT_TTL"`
+ 				DefaultTti            time.Duration `yaml:"defaultTti" envconfig:"ZSCALER_CLIENT_CACHE_DEFAULT_TTI"`
+@@ -122,9 +149,13 @@ type Configuration struct {
+ 		} `yaml:"testing"`
+ 	} `yaml:"zscaler"`
+ 	PrivateKeySigner jose.Signer
+-	CacheManager     cache.Cache
+-	UseLegacyClient  bool `yaml:"useLegacyClient" envconfig:"ZSCALER_USE_LEGACY_CLIENT"`
+-	LegacyClient     *LegacyClient
++	// SigningConfig overrides the yaml/environment signing settings, and
++	// Signer, when set, is used as-is. See the remotesign package.
++	SigningConfig   remotesign.Config
++	Signer          remotesign.Signer
++	CacheManager    cache.Cache
++	UseLegacyClient bool `yaml:"useLegacyClient" envconfig:"ZSCALER_USE_LEGACY_CLIENT"`
++	LegacyClient    *LegacyClient
+ }
+ 
+ // NewConfiguration is the main configuration function, implementing the ConfigSetter pattern.
+@@ -182,6 +213,10 @@ func NewConfiguration(conf ...ConfigSetter) (*Configuration, error) {
+ 		cfg.UserAgent = fmt.Sprintf("%s %s", cfg.UserAgent, cfg.UserAgentExtra)
+ 	}
+ 
++	if err := initRemoteSigner(cfg); err != nil {
++		return nil, err
++	}
++
+ 	ctx := context.WithValue(
+ 		context.Background(),
+ 		ContextAccessToken,
+@@ -236,10 +271,19 @@ func setHttpClients(cfg *Configuration) {
+ func Authenticate(ctx context.Context, cfg *Configuration, l logger.Logger) (*AuthToken, error) {
+ 	creds := cfg.Zscaler.Client
+ 
+-	if creds.ClientID == "" || (creds.ClientSecret == "" && len(creds.PrivateKey) == 0) {
++	if creds.ClientID == "" || (creds.ClientSecret == "" && len(creds.PrivateKey) == 0 && cfg.Signer == nil) {
+ 		return nil, errors.New("no client credentials were provided")
+ 	}
+ 
++	// If a remote signing service is configured, the client assertion is signed
++	// there and the private key never reaches this process.
++	if cfg.Signer != nil {
++		if len(creds.PrivateKey) > 0 {
++			cfg.Logger.Printf("[WARN] both a private key and a remote signing service are configured; using the remote signing service")
++		}
++		return authenticateWithSigner(ctx, cfg, l)
++	}
++
+ 	// If private key is provided, use JWT-based authentication.
+ 	if len(creds.PrivateKey) > 0 {
+ 		return authenticateWithCert(cfg)
+@@ -354,6 +398,7 @@ func authenticateWithCert(cfg *Configuration) (*AuthToken, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error parsing response: %v", err)
+ 	}
++	setTokenExpiry(cfg, &tokenResponse)
+ 
+ 	return &tokenResponse, nil
+ }
+diff --git a/zscaler/oneapisigning.go b/zscaler/oneapisigning.go
+new file mode 100644
+index 0000000..da40815
+--- /dev/null
++++ b/zscaler/oneapisigning.go
+@@ -0,0 +1,201 @@
++package zscaler
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/zscaler/zscaler-sdk-go/v3/logger"
++	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/remotesign"
++)
++
++// oneAPIAudience is the audience claim expected by the Zscaler OAuth2 provider.
++const oneAPIAudience = "https://api.zscaler.com"
++
++// remoteSigningConfig merges the programmatic signing configuration with the
++// values read from zscaler.yaml and the environment. Programmatic values win.
++func remoteSigningConfig(cfg *Configuration) remotesign.Config {
++	merged := cfg.SigningConfig
++	fromFile := cfg.Zscaler.Client.Signing
++
++	firstNonEmpty := func(values ...string) string {
++		for _, value := range values {
++			if strings.TrimSpace(value) != "" {
++				return value
++			}
++		}
++		return ""
++	}
++
++	merged.URL = firstNonEmpty(merged.URL, fromFile.URL)
++	merged.Mode = firstNonEmpty(merged.Mode, fromFile.Mode)
++	merged.KeyID = firstNonEmpty(merged.KeyID, fromFile.KeyID)
++	merged.Token = firstNonEmpty(merged.Token, fromFile.Token)
++	merged.AuthMethod = firstNonEmpty(merged.AuthMethod, fromFile.AuthMethod)
++	merged.AuthMount = firstNonEmpty(merged.AuthMount, fromFile.AuthMount)
++	merged.Role = firstNonEmpty(merged.Role, fromFile.Role)
++	merged.JWT = firstNonEmpty(merged.JWT, fromFile.JWT)
++	merged.JWTTokenFile = firstNonEmpty(merged.JWTTokenFile, fromFile.JWTTokenFile)
++	merged.RoleID = firstNonEmpty(merged.RoleID, fromFile.RoleID)
++	merged.SecretID = firstNonEmpty(merged.SecretID, fromFile.SecretID)
++	merged.Namespace = firstNonEmpty(merged.Namespace, fromFile.Namespace)
++	merged.VaultAddress = firstNonEmpty(merged.VaultAddress, fromFile.VaultAddress)
++	merged.RequestFormat = firstNonEmpty(merged.RequestFormat, fromFile.RequestFormat)
++	merged.ResponseFormat = firstNonEmpty(merged.ResponseFormat, fromFile.ResponseFormat)
++	merged.SignatureField = firstNonEmpty(merged.SignatureField, fromFile.SignatureField)
++
++	if merged.KeyVersion == 0 {
++		merged.KeyVersion = fromFile.KeyVersion
++	}
++	if merged.RequestTimeout <= 0 {
++		merged.RequestTimeout = fromFile.RequestTimeout
++	}
++	if merged.RequestTimeout <= 0 {
++		merged.RequestTimeout = cfg.Zscaler.Client.RequestTimeout
++	}
++	if len(merged.Headers) == 0 {
++		merged.Headers = fromFile.Headers
++	}
++	if merged.Logger == nil {
++		merged.Logger = cfg.Logger
++	}
++	return merged
++}
++
++// initRemoteSigner builds the remote signer, if one was configured. It runs
++// after all ConfigSetters have been applied so that configuration errors are
++// reported when the client is created rather than on the first API call.
++func initRemoteSigner(cfg *Configuration) error {
++	merged := remoteSigningConfig(cfg)
++	cfg.SigningConfig = merged
++
++	if cfg.Signer != nil || !merged.IsConfigured() {
++		return nil
++	}
++	signer, err := remotesign.New(merged)
++	if err != nil {
++		return err
++	}
++	cfg.Signer = signer
++	cfg.Logger.Printf("[DEBUG] remote client assertion signing enabled (%s)", merged.URL)
++	return nil
++}
++
++// authenticateWithSigner performs the OAuth2 client credentials flow with a JWT
++// client assertion whose signature is produced by the remote signing service.
++// The private key stays in the KMS/HSM that holds it.
++func authenticateWithSigner(ctx context.Context, cfg *Configuration, l logger.Logger) (*AuthToken, error) {
++	creds := cfg.Zscaler.Client
++	if creds.ClientID == "" {
++		return nil, errors.New("client ID is missing")
++	}
++	if creds.VanityDomain == "" {
++		return nil, errors.New("vanity domain is missing")
++	}
++
++	assertion, err := remotesign.BuildAssertion(ctx, cfg.Signer, remotesign.AssertionParams{
++		ClientID: creds.ClientID,
++		Audience: oneAPIAudience,
++		KeyID:    cfg.SigningConfig.KeyID,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("failed to sign the client assertion for %s: %w", creds.ClientID, err)
++	}
++
++	formData := url.Values{
++		"grant_type":            {"client_credentials"},
++		"client_id":             {creds.ClientID},
++		"client_assertion":      {assertion},
++		"client_assertion_type": {"urn:ietf:params:oauth:client-assertion-type:jwt-bearer"},
++		"audience":              {oneAPIAudience},
++	}
++
++	return postTokenRequest(ctx, cfg, l, getAuthURL(creds.VanityDomain, creds.Cloud), formData)
++}
++
++// postTokenRequest exchanges an OAuth2 form payload for an AuthToken.
++func postTokenRequest(ctx context.Context, cfg *Configuration, l logger.Logger, authURL string, formData url.Values) (*AuthToken, error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader(formData.Encode()))
++	if err != nil {
++		return nil, fmt.Errorf("failed to build the OAuth2 token request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	req.Header.Set("User-Agent", cfg.UserAgent)
++
++	if l != nil {
++		logger.LogRequest(l, req, uuid.NewString(), nil, false)
++	}
++
++	resp, err := cfg.HTTPClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("failed to obtain an OAuth2 token: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read the OAuth2 token response: %w", err)
++	}
++	if resp.StatusCode > 299 {
++		return nil, fmt.Errorf("auth error: got http status: %d, response body: %s", resp.StatusCode, body)
++	}
++
++	var token AuthToken
++	if err := json.Unmarshal(body, &token); err != nil {
++		return nil, fmt.Errorf("failed to parse the OAuth2 token response: %w", err)
++	}
++	setTokenExpiry(cfg, &token)
++	return &token, nil
++}
++
++// setTokenExpiry derives the token expiry from expires_in. Without it the token
++// renewal ticker has nothing to schedule against and the client keeps using an
++// expired token until the API starts rejecting it.
++func setTokenExpiry(cfg *Configuration, token *AuthToken) {
++	if token.ExpiresIn.String() == "" {
++		return
++	}
++	seconds, err := strconv.ParseInt(token.ExpiresIn.String(), 10, 64)
++	if err != nil {
++		cfg.Logger.Printf("[WARN] could not parse expires_in %q: %v", token.ExpiresIn.String(), err)
++		return
++	}
++	token.Expiry = time.Now().Add(time.Duration(seconds) * time.Second)
++	cfg.Logger.Printf("[DEBUG] parsed expires_in=%d seconds, token expiry set to: %s", seconds, token.Expiry.Format(time.RFC3339))
++}
++
++// WithSigningConfig configures remote client assertion signing.
++func WithSigningConfig(signing remotesign.Config) ConfigSetter {
++	return func(c *Configuration) {
++		c.SigningConfig = signing
++	}
++}
++
++// WithSigningURL points the client at a remote signing endpoint, for example a
++// Vault Transit sign endpoint. Everything else is inferred or read from the
++// environment.
++func WithSigningURL(signingURL string) ConfigSetter {
++	return func(c *Configuration) {
++		c.SigningConfig.URL = signingURL
++	}
++}
++
++// WithSigner installs a caller-provided signer, which takes precedence over any
++// other signing configuration. Use it to sign through an SDK this module does
++// not depend on, such as a cloud KMS client.
++func WithSigner(signer remotesign.Signer) ConfigSetter {
++	return func(c *Configuration) {
++		c.Signer = signer
++	}
++}
+diff --git a/zscaler/oneapisigning_test.go b/zscaler/oneapisigning_test.go
+new file mode 100644
+index 0000000..204f978
+--- /dev/null
++++ b/zscaler/oneapisigning_test.go
+@@ -0,0 +1,316 @@
++package zscaler
++
++import (
++	"context"
++	"crypto"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v5"
++	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/remotesign"
++)
++
++// rewriteTransport sends every request to the test server instead of to the
++// real Zscaler OAuth2 host, so the full authentication path can be exercised.
++type rewriteTransport struct {
++	target *url.URL
++}
++
++func (t rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
++	clone := req.Clone(req.Context())
++	clone.URL.Scheme = t.target.Scheme
++	clone.URL.Host = t.target.Host
++	return http.DefaultTransport.RoundTrip(clone)
++}
++
++type oneAPITestEnv struct {
++	key           *rsa.PrivateKey
++	vaultURL      string
++	authURL       string
++	vaultRequests int
++	lastForm      url.Values
++	assertionErr  error
++}
++
++// newOneAPITestEnv starts a fake Vault Transit engine and a fake Zscaler OAuth2
++// provider that only issues a token for a correctly signed client assertion.
++func newOneAPITestEnv(t *testing.T) *oneAPITestEnv {
++	t.Helper()
++	key, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatalf("generating key: %v", err)
++	}
++	env := &oneAPITestEnv{key: key}
++
++	vault := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		env.vaultRequests++
++		var body struct {
++			Input string `json:"input"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		if got := r.Header.Get("X-Vault-Token"); got != "hvs.test-token" {
++			w.WriteHeader(http.StatusForbidden)
++			_, _ = w.Write([]byte(`{"errors":["permission denied"]}`))
++			return
++		}
++		input, err := base64.StdEncoding.DecodeString(body.Input)
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		digest := sha256.Sum256(input)
++		signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
++		if err != nil {
++			http.Error(w, err.Error(), http.StatusInternalServerError)
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"data": map[string]interface{}{"signature": "vault:v1:" + base64.StdEncoding.EncodeToString(signature)},
++		})
++	}))
++	t.Cleanup(vault.Close)
++
++	auth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if err := r.ParseForm(); err != nil {
++			http.Error(w, err.Error(), http.StatusBadRequest)
++			return
++		}
++		env.lastForm = r.PostForm
++
++		claims := jwt.MapClaims{}
++		_, err := jwt.ParseWithClaims(r.PostForm.Get("client_assertion"), claims, func(*jwt.Token) (interface{}, error) {
++			return &key.PublicKey, nil
++		}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithAudience("https://api.zscaler.com"), jwt.WithIssuer("test-client-id"))
++		if err != nil {
++			env.assertionErr = err
++			w.WriteHeader(http.StatusUnauthorized)
++			_, _ = w.Write([]byte(`{"error":"invalid_client"}`))
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]interface{}{
++			"token_type":   "Bearer",
++			"access_token": "issued-access-token",
++			"expires_in":   "3600",
++		})
++	}))
++	t.Cleanup(auth.Close)
++
++	env.vaultURL = vault.URL + "/v1/transit/sign/zscaler-oneapi"
++	env.authURL = auth.URL
++	return env
++}
++
++func (e *oneAPITestEnv) configure(t *testing.T, setters ...ConfigSetter) *Configuration {
++	t.Helper()
++	cfg, err := NewConfiguration(setters...)
++	if err != nil {
++		t.Fatalf("NewConfiguration: %v", err)
++	}
++	target, err := url.Parse(e.authURL)
++	if err != nil {
++		t.Fatalf("parsing auth URL: %v", err)
++	}
++	cfg.HTTPClient = &http.Client{Transport: rewriteTransport{target: target}, Timeout: 10 * time.Second}
++	return cfg
++}
++
++func TestAuthenticateWithRemoteSigningService(t *testing.T) {
++	env := newOneAPITestEnv(t)
++
++	cfg := env.configure(t,
++		WithClientID("test-client-id"),
++		WithVanityDomain("acme"),
++		WithSigningConfig(remotesign.Config{
++			URL:   env.vaultURL,
++			Token: "hvs.test-token",
++		}),
++	)
++
++	if cfg.Signer == nil {
++		t.Fatal("NewConfiguration did not build a signer")
++	}
++
++	token, err := Authenticate(context.Background(), cfg, cfg.Logger)
++	if err != nil {
++		t.Fatalf("Authenticate: %v (assertion error: %v)", err, env.assertionErr)
++	}
++	if token.AccessToken != "issued-access-token" {
++		t.Errorf("access token = %q, want issued-access-token", token.AccessToken)
++	}
++	// Without an expiry the renewal ticker has nothing to schedule against.
++	if token.Expiry.IsZero() {
++		t.Error("token expiry was not set from expires_in")
++	}
++	if remaining := time.Until(token.Expiry); remaining < 59*time.Minute || remaining > 61*time.Minute {
++		t.Errorf("token expires in %s, want about an hour", remaining)
++	}
++
++	if got := env.lastForm.Get("client_assertion_type"); got != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
++		t.Errorf("client_assertion_type = %q", got)
++	}
++	if got := env.lastForm.Get("grant_type"); got != "client_credentials" {
++		t.Errorf("grant_type = %q, want client_credentials", got)
++	}
++	if got := env.lastForm.Get("client_id"); got != "test-client-id" {
++		t.Errorf("client_id = %q, want test-client-id", got)
++	}
++	if env.lastForm.Get("client_secret") != "" {
++		t.Error("no client secret must be sent when signing remotely")
++	}
++	if env.vaultRequests != 1 {
++		t.Errorf("Vault was called %d times, want 1", env.vaultRequests)
++	}
++}
++
++func TestAuthenticateWithSigningURLSetter(t *testing.T) {
++	env := newOneAPITestEnv(t)
++
++	cfg := env.configure(t,
++		WithClientID("test-client-id"),
++		WithVanityDomain("acme"),
++		WithSigningURL(env.vaultURL),
++		WithSigningConfig(remotesign.Config{URL: env.vaultURL, Token: "hvs.test-token"}),
++	)
++	if _, err := Authenticate(context.Background(), cfg, cfg.Logger); err != nil {
++		t.Fatalf("Authenticate: %v", err)
++	}
++}
++
++// stubSigner signs locally, standing in for a caller supplied KMS client.
++type stubSigner struct {
++	key    *rsa.PrivateKey
++	called int
++}
++
++func (s *stubSigner) Sign(_ context.Context, signingInput []byte) ([]byte, error) {
++	s.called++
++	digest := sha256.Sum256(signingInput)
++	return rsa.SignPKCS1v15(rand.Reader, s.key, crypto.SHA256, digest[:])
++}
++
++func TestCallerSuppliedSignerTakesPrecedenceOverPrivateKey(t *testing.T) {
++	env := newOneAPITestEnv(t)
++	signer := &stubSigner{key: env.key}
++
++	cfg := env.configure(t,
++		WithClientID("test-client-id"),
++		WithVanityDomain("acme"),
++		WithSigner(signer),
++		func(c *Configuration) {
++			// A stale private key in the environment must not win over an
++			// explicitly configured signer.
++			c.Zscaler.Client.PrivateKey = []byte("-----BEGIN RSA PRIVATE KEY-----\nnot a key\n-----END RSA PRIVATE KEY-----")
++		},
++	)
++
++	if _, err := Authenticate(context.Background(), cfg, cfg.Logger); err != nil {
++		t.Fatalf("Authenticate: %v (assertion error: %v)", err, env.assertionErr)
++	}
++	if signer.called != 1 {
++		t.Errorf("signer called %d times, want 1", signer.called)
++	}
++	if env.vaultRequests != 0 {
++		t.Errorf("Vault was called %d times, want 0", env.vaultRequests)
++	}
++}
++
++func TestAuthenticateReportsSigningFailures(t *testing.T) {
++	env := newOneAPITestEnv(t)
++
++	cfg := env.configure(t,
++		WithClientID("test-client-id"),
++		WithVanityDomain("acme"),
++		WithSigningConfig(remotesign.Config{URL: env.vaultURL, Token: "hvs.wrong-token"}),
++	)
++
++	_, err := Authenticate(context.Background(), cfg, cfg.Logger)
++	if err == nil {
++		t.Fatal("expected an error when the signing service rejects the client")
++	}
++	if !strings.Contains(err.Error(), "permission denied") {
++		t.Errorf("error %q does not explain that signing failed", err)
++	}
++}
++
++func TestNewConfigurationRejectsInvalidSigningConfiguration(t *testing.T) {
++	_, err := NewConfiguration(
++		WithClientID("test-client-id"),
++		WithVanityDomain("acme"),
++		WithSigningConfig(remotesign.Config{URL: "vault.example.com/v1/transit/sign/key"}),
++	)
++	if err == nil {
++		t.Fatal("expected NewConfiguration to reject a relative signing URL")
++	}
++	if !strings.Contains(err.Error(), "absolute http(s) URL") {
++		t.Errorf("error %q does not explain the problem", err)
++	}
++}
++
++func TestAuthenticateStillRequiresCredentials(t *testing.T) {
++	cfg, err := NewConfiguration(WithClientID("test-client-id"), WithVanityDomain("acme"))
++	if err != nil {
++		t.Fatalf("NewConfiguration: %v", err)
++	}
++	if _, err := Authenticate(context.Background(), cfg, cfg.Logger); err == nil || !strings.Contains(err.Error(), "no client credentials") {
++		t.Fatalf("error = %v, want a missing credentials error", err)
++	}
++}
++
++func TestRemoteSigningConfigPrecedence(t *testing.T) {
++	cfg, err := NewConfiguration(
++		WithClientID("test-client-id"),
++		WithVanityDomain("acme"),
++		func(c *Configuration) {
++			// Values that would come from zscaler.yaml or the environment.
++			c.Zscaler.Client.Signing.URL = "https://vault.example.com/v1/transit/sign/from-file"
++			c.Zscaler.Client.Signing.Namespace = "admin"
++			c.Zscaler.Client.Signing.KeyVersion = 4
++			c.Zscaler.Client.Signing.Token = "hvs.from-file"
++		},
++		// Values set programmatically win field by field.
++		WithSigningConfig(remotesign.Config{URL: "https://vault.example.com/v1/transit/sign/explicit", Token: "hvs.explicit"}),
++	)
++	if err != nil {
++		t.Fatalf("NewConfiguration: %v", err)
++	}
++
++	if got := cfg.SigningConfig.URL; got != "https://vault.example.com/v1/transit/sign/explicit" {
++		t.Errorf("URL = %q, want the programmatic value", got)
++	}
++	if got := cfg.SigningConfig.Token; got != "hvs.explicit" {
++		t.Errorf("Token = %q, want the programmatic value", got)
++	}
++	if got := cfg.SigningConfig.Namespace; got != "admin" {
++		t.Errorf("Namespace = %q, want the value from the file", got)
++	}
++	if got := cfg.SigningConfig.KeyVersion; got != 4 {
++		t.Errorf("KeyVersion = %d, want the value from the file", got)
++	}
++	if cfg.Signer == nil {
++		t.Error("no signer was built")
++	}
++}
++
++func TestNoSignerWithoutSigningConfiguration(t *testing.T) {
++	cfg, err := NewConfiguration(WithClientID("id"), WithClientSecret("secret"), WithVanityDomain("acme"))
++	if err != nil {
++		t.Fatalf("NewConfiguration: %v", err)
++	}
++	if cfg.Signer != nil {
++		t.Error("a signer must not be built when no signing service is configured")
++	}
++}
+diff --git a/zscaler/remotesign/http.go b/zscaler/remotesign/http.go
+new file mode 100644
+index 0000000..85c1588
+--- /dev/null
++++ b/zscaler/remotesign/http.go
+@@ -0,0 +1,266 @@
++package remotesign
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++)
++
++// httpSigner posts to a generic JSON signing endpoint.
++type httpSigner struct {
++	url            string
++	keyID          string
++	requestFormat  string
++	responseFormat string
++	signatureField string
++	headers        map[string]string
++	staticToken    string
++	auth           *vaultAuth
++	client         *http.Client
++	logger         Logger
++}
++
++func newHTTPSigner(cfg Config) (Signer, error) {
++	requestFormat := strings.ToLower(strings.TrimSpace(cfg.RequestFormat))
++	if requestFormat == "" {
++		requestFormat = RequestFormatGeneric
++	}
++	if requestFormat != RequestFormatGeneric && requestFormat != RequestFormatAzureKeyVault {
++		return nil, fmt.Errorf("remotesign: unsupported signing request format %q (want %q or %q)", requestFormat, RequestFormatGeneric, RequestFormatAzureKeyVault)
++	}
++
++	responseFormat := strings.ToLower(strings.TrimSpace(cfg.ResponseFormat))
++	if responseFormat == "" {
++		responseFormat = ResponseFormatSignature
++	}
++	if responseFormat != ResponseFormatSignature && responseFormat != ResponseFormatJWT {
++		return nil, fmt.Errorf("remotesign: unsupported signing response format %q (want %q or %q)", responseFormat, ResponseFormatSignature, ResponseFormatJWT)
++	}
++	if responseFormat == ResponseFormatJWT && requestFormat == RequestFormatAzureKeyVault {
++		return nil, fmt.Errorf("remotesign: response format %q is not compatible with request format %q", ResponseFormatJWT, RequestFormatAzureKeyVault)
++	}
++
++	signer := &httpSigner{
++		url:            cfg.URL,
++		keyID:          cfg.KeyID,
++		requestFormat:  requestFormat,
++		responseFormat: responseFormat,
++		signatureField: strings.TrimSpace(cfg.SignatureField),
++		headers:        cfg.Headers,
++		client:         cfg.httpClient(),
++		logger:         cfg.logger(),
++	}
++
++	switch method := cfg.resolveAuthMethod(); method {
++	case AuthMethodNone:
++	case AuthMethodToken:
++		if cfg.Token == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a token", AuthMethodToken)
++		}
++		signer.staticToken = cfg.Token
++	default:
++		// Vault login methods are usable for non-Transit endpoints too, e.g. a
++		// signing gateway that validates Vault tokens.
++		address, err := vaultAddress(cfg)
++		if err != nil {
++			return nil, err
++		}
++		auth, err := newVaultAuth(cfg, address)
++		if err != nil {
++			return nil, err
++		}
++		signer.auth = auth
++	}
++
++	// Only a signer that is actually configured to return a whole assertion may
++	// satisfy AssertionSigner; otherwise BuildAssertion would take the assertion
++	// path for every HTTP signer.
++	if responseFormat == ResponseFormatJWT {
++		return &httpAssertionSigner{httpSigner: signer}, nil
++	}
++	return signer, nil
++}
++
++// httpAssertionSigner is an httpSigner whose endpoint returns a complete,
++// signed client assertion instead of a bare signature.
++type httpAssertionSigner struct {
++	*httpSigner
++}
++
++// signRequest is the generic request body. Both the raw signing input and its
++// SHA-256 digest are provided so an endpoint can sign whichever it expects,
++// and so it can inspect exactly what it is being asked to sign.
++type signRequest struct {
++	Algorithm       string                 `json:"alg"`
++	KeyID           string                 `json:"key_id,omitempty"`
++	SigningInput    string                 `json:"signing_input,omitempty"`
++	Digest          string                 `json:"digest,omitempty"`
++	DigestAlgorithm string                 `json:"digest_algorithm,omitempty"`
++	Claims          map[string]interface{} `json:"claims,omitempty"`
++}
++
++// keyVaultSignRequest is the Azure Key Vault / Managed HSM "sign" body.
++type keyVaultSignRequest struct {
++	Algorithm string `json:"alg"`
++	Value     string `json:"value"`
++}
++
++func (h *httpSigner) Sign(ctx context.Context, signingInput []byte) ([]byte, error) {
++	digest := sha256.Sum256(signingInput)
++
++	var payload interface{}
++	switch h.requestFormat {
++	case RequestFormatAzureKeyVault:
++		payload = keyVaultSignRequest{
++			Algorithm: "RS256",
++			Value:     base64.RawURLEncoding.EncodeToString(digest[:]),
++		}
++	default:
++		payload = signRequest{
++			Algorithm:       "RS256",
++			KeyID:           h.keyID,
++			SigningInput:    base64.RawURLEncoding.EncodeToString(signingInput),
++			Digest:          base64.RawURLEncoding.EncodeToString(digest[:]),
++			DigestAlgorithm: "SHA-256",
++		}
++	}
++
++	body, err := h.post(ctx, payload)
++	if err != nil {
++		return nil, err
++	}
++	value, err := h.extract(body, signatureFieldCandidates)
++	if err != nil {
++		return nil, err
++	}
++	return decodeSignature(value)
++}
++
++// SignAssertion is used when the endpoint returns a complete assertion rather
++// than a bare signature.
++func (h *httpAssertionSigner) SignAssertion(ctx context.Context, claims map[string]interface{}, keyID string) (string, error) {
++	if keyID == "" {
++		keyID = h.keyID
++	}
++	body, err := h.post(ctx, signRequest{Algorithm: "RS256", KeyID: keyID, Claims: claims})
++	if err != nil {
++		return "", err
++	}
++	value, err := h.extract(body, assertionFieldCandidates)
++	if err != nil {
++		return "", err
++	}
++	return strings.Trim(strings.TrimSpace(value), `"`), nil
++}
++
++func (h *httpSigner) post(ctx context.Context, payload interface{}) ([]byte, error) {
++	encoded, err := json.Marshal(payload)
++	if err != nil {
++		return nil, fmt.Errorf("remotesign: encoding signing request: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.url, bytes.NewReader(encoded))
++	if err != nil {
++		return nil, fmt.Errorf("remotesign: building signing request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Accept", "application/json")
++
++	if h.auth != nil {
++		token, err := h.auth.token(ctx, false)
++		if err != nil {
++			return nil, err
++		}
++		if token != "" {
++			req.Header.Set("X-Vault-Token", token)
++		}
++	} else if h.staticToken != "" {
++		req.Header.Set("Authorization", "Bearer "+h.staticToken)
++	}
++	// Explicit headers win over anything derived from the auth settings.
++	for name, value := range h.headers {
++		req.Header.Set(name, value)
++	}
++
++	resp, err := h.client.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("remotesign: calling signing endpoint %s: %w", h.url, err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("remotesign: reading signing response: %w", err)
++	}
++	if resp.StatusCode > 299 {
++		return nil, fmt.Errorf("remotesign: signing endpoint %s returned HTTP %d: %s", h.url, resp.StatusCode, truncate(strings.TrimSpace(string(body)), 256))
++	}
++	return body, nil
++}
++
++var (
++	signatureFieldCandidates = []string{"signature", "data.signature", "value", "result"}
++	assertionFieldCandidates = []string{"assertion", "client_assertion", "jwt", "token", "data.assertion", "value"}
++)
++
++// extract pulls the interesting string out of a signing response. A response
++// that is not JSON is taken verbatim, which covers endpoints that answer with a
++// bare base64 string.
++func (h *httpSigner) extract(body []byte, candidates []string) (string, error) {
++	trimmed := strings.TrimSpace(string(body))
++	if trimmed == "" {
++		return "", fmt.Errorf("remotesign: signing endpoint returned an empty body")
++	}
++
++	var parsed interface{}
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		return trimmed, nil
++	}
++	if s, ok := parsed.(string); ok {
++		return s, nil
++	}
++	document, ok := parsed.(map[string]interface{})
++	if !ok {
++		return "", fmt.Errorf("remotesign: unexpected signing response: %s", truncate(trimmed, 256))
++	}
++
++	if h.signatureField != "" {
++		value, found := lookupPath(document, h.signatureField)
++		if !found {
++			return "", fmt.Errorf("remotesign: signing response has no field %q: %s", h.signatureField, truncate(trimmed, 256))
++		}
++		return value, nil
++	}
++	for _, candidate := range candidates {
++		if value, found := lookupPath(document, candidate); found {
++			return value, nil
++		}
++	}
++	return "", fmt.Errorf("remotesign: could not find a signature in the signing response (looked for %s): %s", strings.Join(candidates, ", "), truncate(trimmed, 256))
++}
++
++// lookupPath resolves a dotted path such as "data.signature" to a string value.
++func lookupPath(document map[string]interface{}, path string) (string, bool) {
++	var current interface{} = document
++	for _, segment := range strings.Split(path, ".") {
++		node, ok := current.(map[string]interface{})
++		if !ok {
++			return "", false
++		}
++		current, ok = node[segment]
++		if !ok {
++			return "", false
++		}
++	}
++	value, ok := current.(string)
++	if !ok || value == "" {
++		return "", false
++	}
++	return value, true
++}
+diff --git a/zscaler/remotesign/http_test.go b/zscaler/remotesign/http_test.go
+new file mode 100644
+index 0000000..488a90a
+--- /dev/null
++++ b/zscaler/remotesign/http_test.go
+@@ -0,0 +1,347 @@
++package remotesign
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/golang-jwt/jwt/v5"
++)
++
++// httpSignerServer records the last request and answers with a signature
++// rendered by the responder.
++type httpSignerServer struct {
++	*httptest.Server
++	LastBody    map[string]interface{}
++	LastHeaders http.Header
++	Status      int
++	Responder   func(signature []byte, body map[string]interface{}) (contentType string, payload string)
++}
++
++func newHTTPSignerServer(t *testing.T) *httpSignerServer {
++	t.Helper()
++	server := &httpSignerServer{Status: http.StatusOK}
++	server.Responder = func(signature []byte, _ map[string]interface{}) (string, string) {
++		return "application/json", fmt.Sprintf(`{"signature":%q}`, base64.RawURLEncoding.EncodeToString(signature))
++	}
++	server.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		raw, _ := io.ReadAll(r.Body)
++		var body map[string]interface{}
++		_ = json.Unmarshal(raw, &body)
++		server.LastBody = body
++		server.LastHeaders = r.Header.Clone()
++
++		if server.Status != http.StatusOK {
++			w.WriteHeader(server.Status)
++			_, _ = w.Write([]byte(`{"error":"signing refused"}`))
++			return
++		}
++
++		signingInput := decodeSigningInput(t, body)
++		contentType, payload := server.Responder(signRS256(t, signingInput), body)
++		w.Header().Set("Content-Type", contentType)
++		_, _ = w.Write([]byte(payload))
++	}))
++	t.Cleanup(server.Close)
++	return server
++}
++
++// decodeSigningInput reconstructs what the endpoint was asked to sign. The
++// generic format carries the signing input itself; the Key Vault format carries
++// only its digest, so those responders sign the digest directly.
++func decodeSigningInput(t *testing.T, body map[string]interface{}) []byte {
++	t.Helper()
++	if encoded := asString(body["signing_input"]); encoded != "" {
++		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
++		if err != nil {
++			t.Fatalf("signing_input is not raw base64url: %v", err)
++		}
++		return decoded
++	}
++	return nil
++}
++
++func TestGenericHTTPSignerRoundTrip(t *testing.T) {
++	server := newHTTPSignerServer(t)
++
++	signer, err := New(Config{URL: server.URL, Token: "signing-service-token", KeyID: "key-1"})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	assertion, err := BuildAssertion(context.Background(), signer, AssertionParams{
++		ClientID: "client-123",
++		Audience: "https://api.zscaler.com",
++		KeyID:    "key-1",
++	})
++	if err != nil {
++		t.Fatalf("BuildAssertion: %v", err)
++	}
++	verifyAssertion(t, assertion)
++
++	if got := asString(server.LastBody["alg"]); got != "RS256" {
++		t.Errorf("alg = %q, want RS256", got)
++	}
++	if got := asString(server.LastBody["key_id"]); got != "key-1" {
++		t.Errorf("key_id = %q, want key-1", got)
++	}
++	if got := server.LastHeaders.Get("Authorization"); got != "Bearer signing-service-token" {
++		t.Errorf("Authorization = %q, want a bearer token", got)
++	}
++
++	// The digest must match the signing input the endpoint was handed.
++	signingInput := decodeSigningInput(t, server.LastBody)
++	wantDigest := sha256.Sum256(signingInput)
++	if got := asString(server.LastBody["digest"]); got != base64.RawURLEncoding.EncodeToString(wantDigest[:]) {
++		t.Error("digest does not match signing_input")
++	}
++	if want := assertion[:strings.LastIndex(assertion, ".")]; string(signingInput) != want {
++		t.Errorf("signed input = %q, want %q", signingInput, want)
++	}
++}
++
++func TestAzureKeyVaultRequestFormat(t *testing.T) {
++	server := newHTTPSignerServer(t)
++	// Key Vault signs the digest it is given and answers {"kid":...,"value":...}.
++	server.Responder = func(_ []byte, body map[string]interface{}) (string, string) {
++		digest, err := base64.RawURLEncoding.DecodeString(asString(body["value"]))
++		if err != nil {
++			t.Fatalf("value is not raw base64url: %v", err)
++		}
++		signature := signPrehashedRS256(t, digest)
++		return "application/json", fmt.Sprintf(`{"kid":"https://kv.vault.azure.net/keys/k/1","value":%q}`,
++			base64.RawURLEncoding.EncodeToString(signature))
++	}
++
++	signer, err := New(Config{
++		URL:           server.URL + "/keys/zscaler/1234/sign?api-version=7.4",
++		Mode:          ModeHTTP,
++		RequestFormat: RequestFormatAzureKeyVault,
++		Token:         "aad-access-token",
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	assertion, err := BuildAssertion(context.Background(), signer, AssertionParams{
++		ClientID: "client-123",
++		Audience: "https://api.zscaler.com",
++	})
++	if err != nil {
++		t.Fatalf("BuildAssertion: %v", err)
++	}
++	verifyAssertion(t, assertion)
++
++	if _, ok := server.LastBody["signing_input"]; ok {
++		t.Error("the Key Vault request body must carry only alg and value")
++	}
++	if got := asString(server.LastBody["alg"]); got != "RS256" {
++		t.Errorf("alg = %q, want RS256", got)
++	}
++}
++
++func TestSignatureEncodingsAndFieldLookup(t *testing.T) {
++	cases := []struct {
++		name           string
++		signatureField string
++		responder      func(signature []byte, body map[string]interface{}) (string, string)
++	}{
++		{
++			name: "nested data.signature with a vault prefix",
++			responder: func(signature []byte, _ map[string]interface{}) (string, string) {
++				return "application/json", fmt.Sprintf(`{"data":{"signature":"vault:v2:%s"}}`, base64.StdEncoding.EncodeToString(signature))
++			},
++		},
++		{
++			name: "standard base64 in value",
++			responder: func(signature []byte, _ map[string]interface{}) (string, string) {
++				return "application/json", fmt.Sprintf(`{"value":%q}`, base64.StdEncoding.EncodeToString(signature))
++			},
++		},
++		{
++			name: "bare base64 body",
++			responder: func(signature []byte, _ map[string]interface{}) (string, string) {
++				return "text/plain", base64.StdEncoding.EncodeToString(signature)
++			},
++		},
++		{
++			name: "hex body",
++			responder: func(signature []byte, _ map[string]interface{}) (string, string) {
++				return "text/plain", fmt.Sprintf("%x", signature)
++			},
++		},
++		{
++			name:           "custom field path",
++			signatureField: "result.inner.sig",
++			responder: func(signature []byte, _ map[string]interface{}) (string, string) {
++				return "application/json", fmt.Sprintf(`{"result":{"inner":{"sig":%q}}}`, base64.RawURLEncoding.EncodeToString(signature))
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			server := newHTTPSignerServer(t)
++			server.Responder = tc.responder
++
++			signer, err := New(Config{URL: server.URL, SignatureField: tc.signatureField})
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++			assertion, err := BuildAssertion(context.Background(), signer, AssertionParams{
++				ClientID: "client-123",
++				Audience: "https://api.zscaler.com",
++			})
++			if err != nil {
++				t.Fatalf("BuildAssertion: %v", err)
++			}
++			verifyAssertion(t, assertion)
++		})
++	}
++}
++
++func TestAssertionResponseFormat(t *testing.T) {
++	var seen map[string]interface{}
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		raw, _ := io.ReadAll(r.Body)
++		_ = json.Unmarshal(raw, &seen)
++
++		claims := jwt.MapClaims{}
++		for name, value := range seen["claims"].(map[string]interface{}) {
++			claims[name] = value
++		}
++		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
++		signed, err := token.SignedString(signingKey(t))
++		if err != nil {
++			t.Errorf("signing assertion: %v", err)
++		}
++		writeJSON(w, http.StatusOK, map[string]interface{}{"assertion": signed})
++	}))
++	t.Cleanup(server.Close)
++
++	signer, err := New(Config{URL: server.URL, ResponseFormat: ResponseFormatJWT})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	assertion, err := BuildAssertion(context.Background(), signer, AssertionParams{
++		ClientID: "client-123",
++		Audience: "https://api.zscaler.com",
++	})
++	if err != nil {
++		t.Fatalf("BuildAssertion: %v", err)
++	}
++
++	claims := verifyAssertion(t, assertion)
++	if got, _ := claims["iss"].(string); got != "client-123" {
++		t.Errorf("iss = %q, want client-123", got)
++	}
++	if _, ok := seen["signing_input"]; ok {
++		t.Error("the assertion request must send claims, not a signing input")
++	}
++}
++
++func TestHTTPSignerErrorPaths(t *testing.T) {
++	t.Run("http error is surfaced", func(t *testing.T) {
++		server := newHTTPSignerServer(t)
++		server.Status = http.StatusForbidden
++
++		signer, _ := New(Config{URL: server.URL})
++		_, err := signer.Sign(context.Background(), []byte("header.payload"))
++		if err == nil || !strings.Contains(err.Error(), "403") {
++			t.Fatalf("error = %v, want an HTTP 403 error", err)
++		}
++	})
++
++	t.Run("missing signature field", func(t *testing.T) {
++		server := newHTTPSignerServer(t)
++		server.Responder = func([]byte, map[string]interface{}) (string, string) {
++			return "application/json", `{"unexpected":"shape"}`
++		}
++		signer, _ := New(Config{URL: server.URL})
++		_, err := signer.Sign(context.Background(), []byte("header.payload"))
++		if err == nil || !strings.Contains(err.Error(), "could not find a signature") {
++			t.Fatalf("error = %v, want a missing signature error", err)
++		}
++	})
++
++	t.Run("undecodable signature", func(t *testing.T) {
++		server := newHTTPSignerServer(t)
++		server.Responder = func([]byte, map[string]interface{}) (string, string) {
++			return "application/json", `{"signature":"not a signature!!"}`
++		}
++		signer, _ := New(Config{URL: server.URL})
++		_, err := signer.Sign(context.Background(), []byte("header.payload"))
++		if err == nil || !strings.Contains(err.Error(), "could not decode signature") {
++			t.Fatalf("error = %v, want a decoding error", err)
++		}
++	})
++
++	t.Run("empty body", func(t *testing.T) {
++		server := newHTTPSignerServer(t)
++		server.Responder = func([]byte, map[string]interface{}) (string, string) {
++			return "text/plain", ""
++		}
++		signer, _ := New(Config{URL: server.URL})
++		_, err := signer.Sign(context.Background(), []byte("header.payload"))
++		if err == nil || !strings.Contains(err.Error(), "empty body") {
++			t.Fatalf("error = %v, want an empty body error", err)
++		}
++	})
++
++	t.Run("incompatible formats", func(t *testing.T) {
++		_, err := New(Config{URL: "https://kms.example.com/sign", RequestFormat: RequestFormatAzureKeyVault, ResponseFormat: ResponseFormatJWT})
++		if err == nil || !strings.Contains(err.Error(), "not compatible") {
++			t.Fatalf("error = %v, want an incompatible format error", err)
++		}
++	})
++
++	t.Run("unknown request format", func(t *testing.T) {
++		_, err := New(Config{URL: "https://kms.example.com/sign", RequestFormat: "protobuf"})
++		if err == nil || !strings.Contains(err.Error(), "unsupported signing request format") {
++			t.Fatalf("error = %v, want an unsupported format error", err)
++		}
++	})
++}
++
++func TestExplicitHeadersOverrideDerivedAuthHeader(t *testing.T) {
++	server := newHTTPSignerServer(t)
++	signer, err := New(Config{
++		URL:     server.URL,
++		Token:   "bearer-token",
++		Headers: map[string]string{"Authorization": "Basic Zm9vOmJhcg=="},
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++		t.Fatalf("Sign: %v", err)
++	}
++	if got := server.LastHeaders.Get("Authorization"); got != "Basic Zm9vOmJhcg==" {
++		t.Errorf("Authorization = %q, want the explicitly configured header", got)
++	}
++}
++
++func TestBuildAssertionValidation(t *testing.T) {
++	server := newHTTPSignerServer(t)
++	signer, _ := New(Config{URL: server.URL})
++
++	if _, err := BuildAssertion(context.Background(), nil, AssertionParams{ClientID: "c", Audience: "a"}); err == nil {
++		t.Error("expected an error without a signer")
++	}
++	if _, err := BuildAssertion(context.Background(), signer, AssertionParams{Audience: "a"}); err == nil {
++		t.Error("expected an error without a client ID")
++	}
++	if _, err := BuildAssertion(context.Background(), signer, AssertionParams{ClientID: "c"}); err == nil {
++		t.Error("expected an error without an audience")
++	}
++	if _, err := New(Config{}); err == nil {
++		t.Error("expected an error without a signing URL")
++	}
++}
+diff --git a/zscaler/remotesign/prehashed_test.go b/zscaler/remotesign/prehashed_test.go
+new file mode 100644
+index 0000000..a04f0aa
+--- /dev/null
++++ b/zscaler/remotesign/prehashed_test.go
+@@ -0,0 +1,19 @@
++package remotesign
++
++import (
++	"crypto"
++	"crypto/rand"
++	"crypto/rsa"
++	"testing"
++)
++
++// signPrehashedRS256 signs an already computed SHA-256 digest, which is what a
++// KMS "sign" operation does.
++func signPrehashedRS256(t *testing.T, digest []byte) []byte {
++	t.Helper()
++	signature, err := rsa.SignPKCS1v15(rand.Reader, signingKey(t), crypto.SHA256, digest)
++	if err != nil {
++		t.Fatalf("signing digest: %v", err)
++	}
++	return signature
++}
+diff --git a/zscaler/remotesign/remotesign.go b/zscaler/remotesign/remotesign.go
+new file mode 100644
+index 0000000..e459929
+--- /dev/null
++++ b/zscaler/remotesign/remotesign.go
+@@ -0,0 +1,369 @@
++// Package remotesign builds OAuth2 JWT client assertions whose signature is
++// produced by a remote signing service instead of by a locally held private key.
++//
++// Zscaler OneAPI authenticates a client either with a client secret or with a
++// JWT client assertion signed by the private key of a registered public key.
++// The assertion is a short-lived, self-signed token, so the only thing that has
++// to happen locally is the assembly of the header and the claim set - the
++// signing operation itself can be delegated. Delegating it means the private
++// key never has to leave the KMS/HSM that generated it, which in turn means it
++// never has to be created as an exportable key.
++//
++// Two transports are supported out of the box:
++//
++//   - ModeVaultTransit: HashiCorp Vault / HCP Vault Dedicated Transit engine
++//     (POST {mount}/sign/{key}), including Vault token, JWT/OIDC workload
++//     identity and AppRole authentication against Vault itself.
++//   - ModeHTTP: a generic JSON HTTP endpoint, with a request body shape that
++//     also covers the Azure Key Vault / Managed HSM "sign" operation.
++//
++// Anything else can be plugged in programmatically by implementing Signer.
++package remotesign
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/hex"
++	"fmt"
++	"net/http"
++	"regexp"
++	"strings"
++	"time"
++
++	"github.com/golang-jwt/jwt/v5"
++)
++
++// Signing transports.
++const (
++	// ModeVaultTransit talks to a HashiCorp Vault Transit secrets engine.
++	ModeVaultTransit = "vault_transit"
++	// ModeHTTP talks to a generic JSON signing endpoint.
++	ModeHTTP = "http"
++)
++
++// Request body shapes for ModeHTTP.
++const (
++	// RequestFormatGeneric posts {"alg","key_id","signing_input","digest",...}.
++	RequestFormatGeneric = "generic"
++	// RequestFormatAzureKeyVault posts {"alg":"RS256","value":"<base64url digest>"},
++	// which is what Azure Key Vault and Managed HSM expect on
++	// POST {vault}/keys/{name}/{version}/sign?api-version=7.4.
++	RequestFormatAzureKeyVault = "azure_keyvault"
++)
++
++// Response shapes for ModeHTTP.
++const (
++	// ResponseFormatSignature means the endpoint returns a bare signature.
++	ResponseFormatSignature = "signature"
++	// ResponseFormatJWT means the endpoint returns a fully assembled assertion.
++	ResponseFormatJWT = "jwt"
++)
++
++// Authentication methods used to authenticate to the signing service itself.
++const (
++	// AuthMethodNone sends no credentials (mTLS, network policy, sidecar proxy).
++	AuthMethodNone = "none"
++	// AuthMethodToken sends a static token.
++	AuthMethodToken = "token"
++	// AuthMethodVaultJWT exchanges a workload identity JWT for a Vault token
++	// through the Vault JWT/OIDC (or Kubernetes) auth method.
++	AuthMethodVaultJWT = "vault_jwt"
++	// AuthMethodVaultAppRole logs in with a Vault AppRole role_id/secret_id pair.
++	AuthMethodVaultAppRole = "vault_approle"
++)
++
++// DefaultRequestTimeout bounds a single call to the signing service.
++const DefaultRequestTimeout = 30 * time.Second
++
++// Logger is the subset of the SDK logger used here.
++type Logger interface {
++	Printf(format string, v ...interface{})
++}
++
++type nopLogger struct{}
++
++func (nopLogger) Printf(string, ...interface{}) {}
++
++// Signer produces the signature of a JWT signing input ("<header>.<payload>").
++// Implementations must produce an RS256 (RSASSA-PKCS1-v1_5 over SHA-256)
++// signature, which is the only algorithm Zscaler OneAPI accepts today.
++type Signer interface {
++	Sign(ctx context.Context, signingInput []byte) (signature []byte, err error)
++}
++
++// AssertionSigner is an optional interface for services that mint the complete
++// assertion themselves. When a Signer also implements AssertionSigner,
++// BuildAssertion delegates to it and never assembles a JWT locally.
++type AssertionSigner interface {
++	SignAssertion(ctx context.Context, claims map[string]interface{}, keyID string) (string, error)
++}
++
++// Config describes how to reach the signing service. The zero value is invalid;
++// URL is always required unless a Signer is supplied programmatically.
++type Config struct {
++	// URL is the full signing endpoint, e.g.
++	// https://vault.example.com/v1/transit/sign/zscaler-oneapi
++	URL string
++	// Mode selects the transport. Empty means "infer from URL".
++	Mode string
++	// KeyID, when set, is emitted as the "kid" JOSE header of the assertion.
++	KeyID string
++
++	// Token is a static credential for the signing service: an X-Vault-Token in
++	// Vault mode, a bearer token in HTTP mode.
++	Token string
++	// AuthMethod selects how to authenticate to the signing service. Empty means
++	// "infer": token when Token is set, vault_jwt when a role and a JWT are set,
++	// vault_approle when RoleID/SecretID are set, otherwise none.
++	AuthMethod string
++	// AuthMount is the Vault auth mount path (default "jwt" for vault_jwt,
++	// "approle" for vault_approle).
++	AuthMount string
++	// Role is the Vault role to log in as.
++	Role string
++	// JWT is a workload identity token, used verbatim when set.
++	JWT string
++	// JWTTokenFile is a path to a workload identity token. It is re-read on
++	// every login so that projected/rotated tokens keep working.
++	JWTTokenFile string
++	// RoleID and SecretID are AppRole credentials.
++	RoleID   string
++	SecretID string
++
++	// Namespace is sent as X-Vault-Namespace. HCP Vault Dedicated clusters
++	// normally need "admin".
++	Namespace string
++	// KeyVersion pins a Transit key version (0 = latest).
++	KeyVersion int
++	// VaultAddress overrides the Vault base address used for login calls. When
++	// empty it is derived from URL by cutting at the "/v1/" path segment.
++	VaultAddress string
++
++	// RequestFormat and ResponseFormat apply to ModeHTTP only.
++	RequestFormat  string
++	ResponseFormat string
++	// SignatureField overrides response field lookup, e.g. "data.signature".
++	SignatureField string
++	// Headers are extra HTTP headers sent to the signing service.
++	Headers map[string]string
++
++	// RequestTimeout bounds a single signing call (default DefaultRequestTimeout).
++	RequestTimeout time.Duration
++	// HTTPClient overrides the HTTP client used to reach the signing service.
++	HTTPClient *http.Client
++	// Logger receives debug output.
++	Logger Logger
++}
++
++// IsConfigured reports whether anything was configured at all.
++func (c Config) IsConfigured() bool {
++	return strings.TrimSpace(c.URL) != ""
++}
++
++// vaultSignPath matches the Transit sign endpoint of a Vault URL.
++var vaultSignPath = regexp.MustCompile(`/v1/.+/sign/[^/]+`)
++
++// resolveMode returns the configured mode, or infers one from the URL.
++func (c Config) resolveMode() string {
++	if m := strings.ToLower(strings.TrimSpace(c.Mode)); m != "" {
++		return m
++	}
++	if vaultSignPath.MatchString(c.URL) {
++		return ModeVaultTransit
++	}
++	return ModeHTTP
++}
++
++// resolveAuthMethod returns the configured auth method, or infers one.
++func (c Config) resolveAuthMethod() string {
++	if m := strings.ToLower(strings.TrimSpace(c.AuthMethod)); m != "" {
++		return m
++	}
++	switch {
++	case c.Token != "":
++		return AuthMethodToken
++	case c.Role != "" && (c.JWT != "" || c.JWTTokenFile != ""):
++		return AuthMethodVaultJWT
++	case c.RoleID != "" && c.SecretID != "":
++		return AuthMethodVaultAppRole
++	default:
++		return AuthMethodNone
++	}
++}
++
++func (c Config) httpClient() *http.Client {
++	timeout := c.RequestTimeout
++	if timeout <= 0 {
++		timeout = DefaultRequestTimeout
++	}
++	if c.HTTPClient != nil {
++		client := *c.HTTPClient
++		if client.Timeout == 0 {
++			client.Timeout = timeout
++		}
++		return &client
++	}
++	return &http.Client{Timeout: timeout}
++}
++
++func (c Config) logger() Logger {
++	if c.Logger != nil {
++		return c.Logger
++	}
++	return nopLogger{}
++}
++
++// New builds a Signer from cfg.
++func New(cfg Config) (Signer, error) {
++	if !cfg.IsConfigured() {
++		return nil, fmt.Errorf("remotesign: no signing URL configured")
++	}
++	if !strings.HasPrefix(cfg.URL, "http://") && !strings.HasPrefix(cfg.URL, "https://") {
++		return nil, fmt.Errorf("remotesign: signing URL %q must be an absolute http(s) URL", cfg.URL)
++	}
++	switch mode := cfg.resolveMode(); mode {
++	case ModeVaultTransit:
++		return newVaultSigner(cfg)
++	case ModeHTTP:
++		return newHTTPSigner(cfg)
++	default:
++		return nil, fmt.Errorf("remotesign: unsupported signing mode %q (want %q or %q)", mode, ModeVaultTransit, ModeHTTP)
++	}
++}
++
++// AssertionParams describes the client assertion to mint.
++type AssertionParams struct {
++	// ClientID becomes both "iss" and "sub".
++	ClientID string
++	// Audience becomes "aud".
++	Audience string
++	// KeyID, when set, becomes the "kid" JOSE header.
++	KeyID string
++	// Lifetime defaults to 10 minutes, matching the local-key code path.
++	Lifetime time.Duration
++	// Now is overridable for tests.
++	Now func() time.Time
++}
++
++// BuildAssertion assembles a JWT bearer client assertion and has signer sign it.
++func BuildAssertion(ctx context.Context, signer Signer, p AssertionParams) (string, error) {
++	if signer == nil {
++		return "", fmt.Errorf("remotesign: no signer configured")
++	}
++	if p.ClientID == "" {
++		return "", fmt.Errorf("remotesign: client ID is required to build a client assertion")
++	}
++	if p.Audience == "" {
++		return "", fmt.Errorf("remotesign: audience is required to build a client assertion")
++	}
++	lifetime := p.Lifetime
++	if lifetime <= 0 {
++		lifetime = 10 * time.Minute
++	}
++	now := time.Now
++	if p.Now != nil {
++		now = p.Now
++	}
++
++	// Keep the claim set identical to the local private key code path so that
++	// remote signing is a drop-in replacement as far as Zscaler is concerned.
++	claims := map[string]interface{}{
++		"iss": p.ClientID,
++		"sub": p.ClientID,
++		"aud": p.Audience,
++		"exp": now().Add(lifetime).Unix(),
++	}
++
++	if as, ok := signer.(AssertionSigner); ok {
++		assertion, err := as.SignAssertion(ctx, claims, p.KeyID)
++		if err != nil {
++			return "", err
++		}
++		if err := validateAssertionShape(assertion); err != nil {
++			return "", err
++		}
++		return assertion, nil
++	}
++
++	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims(claims))
++	if p.KeyID != "" {
++		token.Header["kid"] = p.KeyID
++	}
++	signingInput, err := token.SigningString()
++	if err != nil {
++		return "", fmt.Errorf("remotesign: building JWT signing input: %w", err)
++	}
++
++	signature, err := signer.Sign(ctx, []byte(signingInput))
++	if err != nil {
++		return "", err
++	}
++	if len(signature) == 0 {
++		return "", fmt.Errorf("remotesign: signing service returned an empty signature")
++	}
++
++	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
++}
++
++func validateAssertionShape(assertion string) error {
++	if strings.Count(assertion, ".") != 2 || strings.HasSuffix(assertion, ".") {
++		return fmt.Errorf("remotesign: signing service did not return a signed JWT")
++	}
++	return nil
++}
++
++var vaultSignaturePrefix = regexp.MustCompile(`^vault:v[0-9]+:`)
++
++// decodeSignature turns whatever encoding the signing service used into raw
++// signature bytes. Vault Transit returns "vault:v1:<std base64>", Azure Key
++// Vault returns unpadded base64url, and some gateways return hex.
++func decodeSignature(value string) ([]byte, error) {
++	s := strings.TrimSpace(value)
++	s = strings.Trim(s, `"`)
++	s = vaultSignaturePrefix.ReplaceAllString(s, "")
++	if s == "" {
++		return nil, fmt.Errorf("remotesign: signing service returned an empty signature")
++	}
++
++	// Hex is checked first for strings that can only be hex: the hex alphabet is
++	// a subset of the base64 one, so an unlucky base64 attempt would otherwise
++	// "succeed" and produce garbage.
++	if isHex(s) {
++		if decoded, err := hex.DecodeString(s); err == nil && len(decoded) > 0 {
++			return decoded, nil
++		}
++	}
++
++	encodings := []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding}
++	if strings.ContainsAny(s, "-_") {
++		encodings = []*base64.Encoding{base64.URLEncoding, base64.RawURLEncoding}
++	}
++	for _, enc := range encodings {
++		if decoded, err := enc.DecodeString(s); err == nil && len(decoded) > 0 {
++			return decoded, nil
++		}
++	}
++	return nil, fmt.Errorf("remotesign: could not decode signature %q as base64 or hex", truncate(s, 32))
++}
++
++// isHex reports whether s can only be a hex encoded byte string.
++func isHex(s string) bool {
++	if s == "" || len(s)%2 != 0 {
++		return false
++	}
++	for _, r := range s {
++		switch {
++		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
++		default:
++			return false
++		}
++	}
++	return true
++}
++
++func truncate(s string, n int) string {
++	if len(s) <= n {
++		return s
++	}
++	return s[:n] + "..."
++}
+diff --git a/zscaler/remotesign/testsupport_test.go b/zscaler/remotesign/testsupport_test.go
+new file mode 100644
+index 0000000..2ba8f46
+--- /dev/null
++++ b/zscaler/remotesign/testsupport_test.go
+@@ -0,0 +1,173 @@
++package remotesign
++
++import (
++	"crypto"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/golang-jwt/jwt/v5"
++)
++
++var (
++	testKeyOnce sync.Once
++	testKey     *rsa.PrivateKey
++)
++
++// signingKey returns a process-wide RSA key. Generating a 2048 bit key is slow
++// enough that it is worth doing exactly once.
++func signingKey(t *testing.T) *rsa.PrivateKey {
++	t.Helper()
++	testKeyOnce.Do(func() {
++		key, err := rsa.GenerateKey(rand.Reader, 2048)
++		if err != nil {
++			panic(err)
++		}
++		testKey = key
++	})
++	return testKey
++}
++
++// signRS256 signs data the way a KMS would.
++func signRS256(t *testing.T, data []byte) []byte {
++	t.Helper()
++	digest := sha256.Sum256(data)
++	signature, err := rsa.SignPKCS1v15(rand.Reader, signingKey(t), crypto.SHA256, digest[:])
++	if err != nil {
++		t.Fatalf("signing test data: %v", err)
++	}
++	return signature
++}
++
++// vaultServer is a minimal stand-in for a Vault Transit engine.
++type vaultServer struct {
++	*httptest.Server
++
++	mu           sync.Mutex
++	SignRequests []map[string]interface{}
++	SignHeaders  []http.Header
++	Logins       int
++	LoginBodies  []map[string]string
++
++	// IssuedToken is handed out by the login endpoints.
++	IssuedToken string
++	// LeaseDuration is reported by the login endpoints.
++	LeaseDuration int
++	// RequireToken, when set, is the only token the sign endpoint accepts.
++	RequireToken string
++	// FailSignOnce makes the first sign call answer 403.
++	FailSignOnce bool
++}
++
++func newVaultServer(t *testing.T) *vaultServer {
++	t.Helper()
++	server := &vaultServer{IssuedToken: "hvs.issued-token", LeaseDuration: 3600}
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("/v1/auth/", func(w http.ResponseWriter, r *http.Request) {
++		if !strings.HasSuffix(r.URL.Path, "/login") {
++			http.NotFound(w, r)
++			return
++		}
++		var body map[string]string
++		_ = json.NewDecoder(r.Body).Decode(&body)
++
++		server.mu.Lock()
++		server.Logins++
++		server.LoginBodies = append(server.LoginBodies, body)
++		token := server.IssuedToken
++		lease := server.LeaseDuration
++		server.mu.Unlock()
++
++		writeJSON(w, http.StatusOK, map[string]interface{}{
++			"auth": map[string]interface{}{
++				"client_token":   token,
++				"lease_duration": lease,
++			},
++		})
++	})
++	mux.HandleFunc("/v1/transit/sign/", func(w http.ResponseWriter, r *http.Request) {
++		var body map[string]interface{}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
++			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"errors": []string{"malformed body"}})
++			return
++		}
++
++		server.mu.Lock()
++		server.SignRequests = append(server.SignRequests, body)
++		server.SignHeaders = append(server.SignHeaders, r.Header.Clone())
++		failOnce := server.FailSignOnce
++		if failOnce {
++			server.FailSignOnce = false
++		}
++		required := server.RequireToken
++		server.mu.Unlock()
++
++		if failOnce {
++			writeJSON(w, http.StatusForbidden, map[string]interface{}{"errors": []string{"permission denied"}})
++			return
++		}
++		if required != "" && r.Header.Get("X-Vault-Token") != required {
++			writeJSON(w, http.StatusForbidden, map[string]interface{}{"errors": []string{"permission denied"}})
++			return
++		}
++
++		input, err := base64.StdEncoding.DecodeString(asString(body["input"]))
++		if err != nil {
++			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"errors": []string{"input is not base64"}})
++			return
++		}
++		writeJSON(w, http.StatusOK, map[string]interface{}{
++			"data": map[string]interface{}{
++				"signature": "vault:v1:" + base64.StdEncoding.EncodeToString(signRS256(t, input)),
++			},
++		})
++	})
++
++	server.Server = httptest.NewServer(mux)
++	t.Cleanup(server.Close)
++	return server
++}
++
++func (v *vaultServer) SignURL() string { return v.URL + "/v1/transit/sign/zscaler-oneapi" }
++
++func (v *vaultServer) snapshot() ([]map[string]interface{}, []http.Header, int) {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	return v.SignRequests, v.SignHeaders, v.Logins
++}
++
++func writeJSON(w http.ResponseWriter, status int, body interface{}) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(body)
++}
++
++func asString(value interface{}) string {
++	s, _ := value.(string)
++	return s
++}
++
++// verifyAssertion checks that assertion is a well formed RS256 JWT signed by the
++// test key and returns its claims.
++func verifyAssertion(t *testing.T, assertion string) jwt.MapClaims {
++	t.Helper()
++	claims := jwt.MapClaims{}
++	parsed, err := jwt.ParseWithClaims(assertion, claims, func(token *jwt.Token) (interface{}, error) {
++		return &signingKey(t).PublicKey, nil
++	}, jwt.WithValidMethods([]string{"RS256"}))
++	if err != nil {
++		t.Fatalf("assertion did not verify: %v", err)
++	}
++	if !parsed.Valid {
++		t.Fatal("assertion is not valid")
++	}
++	return claims
++}
+diff --git a/zscaler/remotesign/vault.go b/zscaler/remotesign/vault.go
+new file mode 100644
+index 0000000..f54a667
+--- /dev/null
++++ b/zscaler/remotesign/vault.go
+@@ -0,0 +1,365 @@
++package remotesign
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	defaultJWTAuthMount     = "jwt"
++	defaultAppRoleAuthMount = "approle"
++
++	// vaultTokenRenewSkew is how long before its lease a cached Vault token is
++	// considered stale.
++	vaultTokenRenewSkew = 60 * time.Second
++)
++
++// vaultSigner signs through a Vault Transit secrets engine.
++type vaultSigner struct {
++	signURL    string
++	namespace  string
++	keyVersion int
++	headers    map[string]string
++	auth       *vaultAuth
++	client     *http.Client
++	logger     Logger
++}
++
++func newVaultSigner(cfg Config) (Signer, error) {
++	address, err := vaultAddress(cfg)
++	if err != nil {
++		return nil, err
++	}
++	auth, err := newVaultAuth(cfg, address)
++	if err != nil {
++		return nil, err
++	}
++	return &vaultSigner{
++		signURL:    cfg.URL,
++		namespace:  cfg.Namespace,
++		keyVersion: cfg.KeyVersion,
++		headers:    cfg.Headers,
++		auth:       auth,
++		client:     cfg.httpClient(),
++		logger:     cfg.logger(),
++	}, nil
++}
++
++// vaultAddress resolves the Vault base address used for login calls. It is
++// either configured explicitly or derived from the signing URL by cutting at
++// the "/v1/" API path segment.
++func vaultAddress(cfg Config) (string, error) {
++	if addr := strings.TrimRight(strings.TrimSpace(cfg.VaultAddress), "/"); addr != "" {
++		return addr, nil
++	}
++	if idx := strings.Index(cfg.URL, "/v1/"); idx > 0 {
++		return cfg.URL[:idx], nil
++	}
++	// Only login flows need the base address; a static token does not.
++	if cfg.resolveAuthMethod() == AuthMethodToken || cfg.resolveAuthMethod() == AuthMethodNone {
++		return "", nil
++	}
++	return "", fmt.Errorf("remotesign: cannot derive the Vault address from signing URL %q; set the Vault address explicitly", cfg.URL)
++}
++
++type vaultSignRequest struct {
++	Input              string `json:"input"`
++	HashAlgorithm      string `json:"hash_algorithm"`
++	SignatureAlgorithm string `json:"signature_algorithm"`
++	Prehashed          bool   `json:"prehashed"`
++	KeyVersion         int    `json:"key_version,omitempty"`
++}
++
++type vaultSignResponse struct {
++	Data struct {
++		Signature string `json:"signature"`
++	} `json:"data"`
++	Errors []string `json:"errors"`
++}
++
++func (v *vaultSigner) Sign(ctx context.Context, signingInput []byte) ([]byte, error) {
++	payload, err := json.Marshal(vaultSignRequest{
++		// Vault hashes the input itself: the assertion signing input is sent
++		// verbatim, never the private key and never a pre-computed digest.
++		Input:              base64.StdEncoding.EncodeToString(signingInput),
++		HashAlgorithm:      "sha2-256",
++		SignatureAlgorithm: "pkcs1v15",
++		Prehashed:          false,
++		KeyVersion:         v.keyVersion,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("remotesign: encoding Vault sign request: %w", err)
++	}
++
++	signature, status, err := v.doSign(ctx, payload, false)
++	// A cached Vault token can expire or be revoked between two assertions;
++	// re-authenticate once and retry before giving up.
++	if err != nil && (status == http.StatusForbidden || status == http.StatusUnauthorized) {
++		v.logger.Printf("[DEBUG] remotesign: Vault rejected the cached token (HTTP %d), re-authenticating", status)
++		v.auth.invalidate()
++		signature, _, err = v.doSign(ctx, payload, true)
++	}
++	return signature, err
++}
++
++func (v *vaultSigner) doSign(ctx context.Context, payload []byte, forceLogin bool) ([]byte, int, error) {
++	token, err := v.auth.token(ctx, forceLogin)
++	if err != nil {
++		return nil, 0, err
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.signURL, bytes.NewReader(payload))
++	if err != nil {
++		return nil, 0, fmt.Errorf("remotesign: building Vault sign request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	for name, value := range v.headers {
++		req.Header.Set(name, value)
++	}
++	if token != "" {
++		req.Header.Set("X-Vault-Token", token)
++	}
++	if v.namespace != "" {
++		req.Header.Set("X-Vault-Namespace", v.namespace)
++	}
++
++	resp, err := v.client.Do(req)
++	if err != nil {
++		return nil, 0, fmt.Errorf("remotesign: calling Vault Transit sign endpoint: %w", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, resp.StatusCode, fmt.Errorf("remotesign: reading Vault response: %w", err)
++	}
++
++	var parsed vaultSignResponse
++	// Vault always answers JSON, but a proxy in front of it might not.
++	_ = json.Unmarshal(body, &parsed)
++
++	if resp.StatusCode > 299 {
++		return nil, resp.StatusCode, fmt.Errorf("remotesign: Vault Transit sign failed with HTTP %d: %s", resp.StatusCode, vaultErrorMessage(parsed.Errors, body))
++	}
++	if parsed.Data.Signature == "" {
++		return nil, resp.StatusCode, fmt.Errorf("remotesign: Vault Transit response contained no signature: %s", truncate(string(body), 256))
++	}
++
++	signature, err := decodeSignature(parsed.Data.Signature)
++	if err != nil {
++		return nil, resp.StatusCode, err
++	}
++	return signature, resp.StatusCode, nil
++}
++
++func vaultErrorMessage(errors []string, body []byte) string {
++	if len(errors) > 0 {
++		return strings.Join(errors, "; ")
++	}
++	return truncate(strings.TrimSpace(string(body)), 256)
++}
++
++// vaultAuth obtains and caches the Vault token used for signing.
++type vaultAuth struct {
++	method    string
++	address   string
++	mount     string
++	role      string
++	jwt       string
++	jwtFile   string
++	roleID    string
++	secretID  string
++	namespace string
++	client    *http.Client
++	logger    Logger
++
++	mu     sync.Mutex
++	token_ string
++	expiry time.Time
++}
++
++func newVaultAuth(cfg Config, address string) (*vaultAuth, error) {
++	method := cfg.resolveAuthMethod()
++	auth := &vaultAuth{
++		method:    method,
++		address:   address,
++		mount:     strings.Trim(strings.TrimSpace(cfg.AuthMount), "/"),
++		role:      cfg.Role,
++		jwt:       cfg.JWT,
++		jwtFile:   cfg.JWTTokenFile,
++		roleID:    cfg.RoleID,
++		secretID:  cfg.SecretID,
++		namespace: cfg.Namespace,
++		client:    cfg.httpClient(),
++		logger:    cfg.logger(),
++	}
++
++	switch method {
++	case AuthMethodNone:
++	case AuthMethodToken:
++		if cfg.Token == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a token", AuthMethodToken)
++		}
++		auth.token_ = cfg.Token
++	case AuthMethodVaultJWT:
++		if auth.mount == "" {
++			auth.mount = defaultJWTAuthMount
++		}
++		if auth.role == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a Vault role", AuthMethodVaultJWT)
++		}
++		if auth.jwt == "" && auth.jwtFile == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a workload identity token or token file", AuthMethodVaultJWT)
++		}
++		if auth.address == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a Vault address", AuthMethodVaultJWT)
++		}
++	case AuthMethodVaultAppRole:
++		if auth.mount == "" {
++			auth.mount = defaultAppRoleAuthMount
++		}
++		if auth.roleID == "" || auth.secretID == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a role ID and a secret ID", AuthMethodVaultAppRole)
++		}
++		if auth.address == "" {
++			return nil, fmt.Errorf("remotesign: signing auth method %q requires a Vault address", AuthMethodVaultAppRole)
++		}
++	default:
++		return nil, fmt.Errorf("remotesign: unsupported signing auth method %q", method)
++	}
++	return auth, nil
++}
++
++// token returns a usable Vault token, logging in when needed.
++func (a *vaultAuth) token(ctx context.Context, forceLogin bool) (string, error) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++
++	switch a.method {
++	case AuthMethodNone:
++		return "", nil
++	case AuthMethodToken:
++		// A static token is not refreshable: hand it back as configured.
++		return a.token_, nil
++	}
++
++	if !forceLogin && a.token_ != "" && (a.expiry.IsZero() || time.Now().Before(a.expiry)) {
++		return a.token_, nil
++	}
++	if err := a.login(ctx); err != nil {
++		return "", err
++	}
++	return a.token_, nil
++}
++
++// invalidate drops a cached login so the next signing call authenticates again.
++func (a *vaultAuth) invalidate() {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.method == AuthMethodToken || a.method == AuthMethodNone {
++		return
++	}
++	a.token_ = ""
++	a.expiry = time.Time{}
++}
++
++type vaultLoginResponse struct {
++	Auth struct {
++		ClientToken   string `json:"client_token"`
++		LeaseDuration int    `json:"lease_duration"`
++	} `json:"auth"`
++	Errors []string `json:"errors"`
++}
++
++func (a *vaultAuth) login(ctx context.Context) error {
++	var payload map[string]string
++	switch a.method {
++	case AuthMethodVaultJWT:
++		assertion, err := a.workloadIdentityToken()
++		if err != nil {
++			return err
++		}
++		payload = map[string]string{"role": a.role, "jwt": assertion}
++	case AuthMethodVaultAppRole:
++		payload = map[string]string{"role_id": a.roleID, "secret_id": a.secretID}
++	default:
++		return fmt.Errorf("remotesign: cannot log in to Vault with auth method %q", a.method)
++	}
++
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return fmt.Errorf("remotesign: encoding Vault login request: %w", err)
++	}
++
++	loginURL := fmt.Sprintf("%s/v1/auth/%s/login", strings.TrimRight(a.address, "/"), a.mount)
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, loginURL, bytes.NewReader(body))
++	if err != nil {
++		return fmt.Errorf("remotesign: building Vault login request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	if a.namespace != "" {
++		req.Header.Set("X-Vault-Namespace", a.namespace)
++	}
++
++	resp, err := a.client.Do(req)
++	if err != nil {
++		return fmt.Errorf("remotesign: logging in to Vault at %s: %w", loginURL, err)
++	}
++	defer resp.Body.Close()
++
++	respBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("remotesign: reading Vault login response: %w", err)
++	}
++
++	var parsed vaultLoginResponse
++	_ = json.Unmarshal(respBody, &parsed)
++
++	if resp.StatusCode > 299 {
++		return fmt.Errorf("remotesign: Vault login failed with HTTP %d: %s", resp.StatusCode, vaultErrorMessage(parsed.Errors, respBody))
++	}
++	if parsed.Auth.ClientToken == "" {
++		return fmt.Errorf("remotesign: Vault login response contained no client token: %s", truncate(strings.TrimSpace(string(respBody)), 256))
++	}
++
++	a.token_ = parsed.Auth.ClientToken
++	// A response without a lease (a root token, for instance) is treated as
++	// non-expiring; a lease shorter than the renewal skew is treated as
++	// single-use, so the next signature logs in again.
++	switch lease := time.Duration(parsed.Auth.LeaseDuration) * time.Second; {
++	case lease > vaultTokenRenewSkew:
++		a.expiry = time.Now().Add(lease - vaultTokenRenewSkew)
++	case lease > 0:
++		a.expiry = time.Now()
++	default:
++		a.expiry = time.Time{}
++	}
++	a.logger.Printf("[DEBUG] remotesign: authenticated to Vault via %s/%s", a.method, a.mount)
++	return nil
++}
++
++// workloadIdentityToken returns the JWT presented to Vault. The file is read on
++// every login because projected service account tokens are rotated in place.
++func (a *vaultAuth) workloadIdentityToken() (string, error) {
++	if a.jwtFile == "" {
++		return a.jwt, nil
++	}
++	content, err := os.ReadFile(a.jwtFile)
++	if err != nil {
++		return "", fmt.Errorf("remotesign: reading workload identity token %s: %w", a.jwtFile, err)
++	}
++	token := strings.TrimSpace(string(content))
++	if token == "" {
++		return "", fmt.Errorf("remotesign: workload identity token file %s is empty", a.jwtFile)
++	}
++	return token, nil
++}
+diff --git a/zscaler/remotesign/vault_test.go b/zscaler/remotesign/vault_test.go
+new file mode 100644
+index 0000000..7edade3
+--- /dev/null
++++ b/zscaler/remotesign/vault_test.go
+@@ -0,0 +1,362 @@
++package remotesign
++
++import (
++	"context"
++	"encoding/base64"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestVaultTransitSignProducesVerifiableAssertion(t *testing.T) {
++	vault := newVaultServer(t)
++	vault.RequireToken = "hvs.static-token"
++
++	signer, err := New(Config{
++		URL:       vault.SignURL(),
++		Token:     "hvs.static-token",
++		Namespace: "admin",
++		KeyID:     "zscaler-key-1",
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	assertion, err := BuildAssertion(context.Background(), signer, AssertionParams{
++		ClientID: "client-123",
++		Audience: "https://api.zscaler.com",
++		KeyID:    "zscaler-key-1",
++	})
++	if err != nil {
++		t.Fatalf("BuildAssertion: %v", err)
++	}
++
++	claims := verifyAssertion(t, assertion)
++	for name, want := range map[string]string{"iss": "client-123", "sub": "client-123", "aud": "https://api.zscaler.com"} {
++		if got, _ := claims[name].(string); got != want {
++			t.Errorf("claim %s = %q, want %q", name, got, want)
++		}
++	}
++	if _, ok := claims["exp"]; !ok {
++		t.Error("assertion has no exp claim")
++	}
++
++	requests, headers, logins := vault.snapshot()
++	if len(requests) != 1 {
++		t.Fatalf("got %d sign requests, want 1", len(requests))
++	}
++	if logins != 0 {
++		t.Errorf("got %d Vault logins for a static token, want 0", logins)
++	}
++
++	request := requests[0]
++	if got := asString(request["hash_algorithm"]); got != "sha2-256" {
++		t.Errorf("hash_algorithm = %q, want sha2-256", got)
++	}
++	if got := asString(request["signature_algorithm"]); got != "pkcs1v15" {
++		t.Errorf("signature_algorithm = %q, want pkcs1v15", got)
++	}
++	if prehashed, _ := request["prehashed"].(bool); prehashed {
++		t.Error("prehashed = true, want false: Vault must hash the signing input itself")
++	}
++	if _, ok := request["key_version"]; ok {
++		t.Error("key_version must be omitted when it is not pinned")
++	}
++
++	// The signing service must receive the signing input, never key material.
++	input, err := base64.StdEncoding.DecodeString(asString(request["input"]))
++	if err != nil {
++		t.Fatalf("input is not standard base64: %v", err)
++	}
++	if want := assertion[:strings.LastIndex(assertion, ".")]; string(input) != want {
++		t.Errorf("signed input = %q, want %q", input, want)
++	}
++
++	if got := headers[0].Get("X-Vault-Token"); got != "hvs.static-token" {
++		t.Errorf("X-Vault-Token = %q, want the configured token", got)
++	}
++	if got := headers[0].Get("X-Vault-Namespace"); got != "admin" {
++		t.Errorf("X-Vault-Namespace = %q, want admin", got)
++	}
++}
++
++func TestVaultTransitPinsKeyVersion(t *testing.T) {
++	vault := newVaultServer(t)
++
++	signer, err := New(Config{URL: vault.SignURL(), Token: "t", KeyVersion: 3})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++		t.Fatalf("Sign: %v", err)
++	}
++
++	requests, _, _ := vault.snapshot()
++	if version, _ := requests[0]["key_version"].(float64); version != 3 {
++		t.Errorf("key_version = %v, want 3", requests[0]["key_version"])
++	}
++}
++
++func TestVaultWorkloadIdentityLoginAndTokenReuse(t *testing.T) {
++	vault := newVaultServer(t)
++	vault.RequireToken = "hvs.issued-token"
++
++	tokenFile := filepath.Join(t.TempDir(), "token")
++	if err := os.WriteFile(tokenFile, []byte("workload-identity-jwt\n"), 0o600); err != nil {
++		t.Fatalf("writing token file: %v", err)
++	}
++
++	signer, err := New(Config{
++		URL:          vault.SignURL(),
++		Role:         "zscaler-terraform",
++		JWTTokenFile: tokenFile,
++		AuthMount:    "jwt",
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	for i := 0; i < 2; i++ {
++		if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++			t.Fatalf("Sign %d: %v", i, err)
++		}
++	}
++
++	_, _, logins := vault.snapshot()
++	if logins != 1 {
++		t.Errorf("got %d logins for 2 signatures, want 1 (the Vault token must be cached)", logins)
++	}
++	if got := vault.LoginBodies[0]["role"]; got != "zscaler-terraform" {
++		t.Errorf("login role = %q, want zscaler-terraform", got)
++	}
++	// The trailing newline of a projected token file must not be sent.
++	if got := vault.LoginBodies[0]["jwt"]; got != "workload-identity-jwt" {
++		t.Errorf("login jwt = %q, want the trimmed file contents", got)
++	}
++}
++
++func TestVaultReauthenticatesAfterPermissionDenied(t *testing.T) {
++	vault := newVaultServer(t)
++	vault.FailSignOnce = true
++
++	signer, err := New(Config{
++		URL:  vault.SignURL(),
++		Role: "zscaler-terraform",
++		JWT:  "workload-identity-jwt",
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++		t.Fatalf("Sign: %v", err)
++	}
++	if _, _, logins := vault.snapshot(); logins != 2 {
++		t.Errorf("got %d logins, want 2 (initial login plus one retry after 403)", logins)
++	}
++}
++
++func TestVaultAppRoleLogin(t *testing.T) {
++	vault := newVaultServer(t)
++	vault.RequireToken = "hvs.issued-token"
++
++	signer, err := New(Config{URL: vault.SignURL(), RoleID: "role-id", SecretID: "secret-id"})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++		t.Fatalf("Sign: %v", err)
++	}
++	if got := vault.LoginBodies[0]["role_id"]; got != "role-id" {
++		t.Errorf("login role_id = %q, want role-id", got)
++	}
++}
++
++func TestVaultShortLeaseIsNotCached(t *testing.T) {
++	vault := newVaultServer(t)
++	vault.LeaseDuration = 5 // shorter than the renewal skew
++
++	signer, err := New(Config{URL: vault.SignURL(), Role: "r", JWT: "j"})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	for i := 0; i < 2; i++ {
++		if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++			t.Fatalf("Sign %d: %v", i, err)
++		}
++	}
++	if _, _, logins := vault.snapshot(); logins != 2 {
++		t.Errorf("got %d logins, want 2: a lease shorter than the skew must not be cached", logins)
++	}
++}
++
++func TestVaultSurfacesServerErrors(t *testing.T) {
++	vault := newVaultServer(t)
++	vault.RequireToken = "hvs.expected"
++
++	signer, err := New(Config{URL: vault.SignURL(), Token: "hvs.wrong"})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	_, err = signer.Sign(context.Background(), []byte("header.payload"))
++	if err == nil {
++		t.Fatal("expected an error for a rejected token")
++	}
++	if !strings.Contains(err.Error(), "permission denied") {
++		t.Errorf("error %q does not surface the Vault message", err)
++	}
++}
++
++func TestVaultAddressDerivation(t *testing.T) {
++	cases := []struct {
++		name string
++		cfg  Config
++		want string
++	}{
++		{
++			name: "derived from the sign URL",
++			cfg:  Config{URL: "https://vault.example.com:8200/v1/transit/sign/key", Role: "r", JWT: "j"},
++			want: "https://vault.example.com:8200",
++		},
++		{
++			name: "explicit override wins",
++			cfg:  Config{URL: "https://gateway.example.com/sign", VaultAddress: "https://vault.example.com/", Role: "r", JWT: "j"},
++			want: "https://vault.example.com",
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := vaultAddress(tc.cfg)
++			if err != nil {
++				t.Fatalf("vaultAddress: %v", err)
++			}
++			if got != tc.want {
++				t.Errorf("vaultAddress = %q, want %q", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestVaultConfigValidation(t *testing.T) {
++	cases := []struct {
++		name    string
++		cfg     Config
++		wantErr string
++	}{
++		{
++			name:    "jwt auth without a role",
++			cfg:     Config{URL: "https://v.example.com/v1/transit/sign/k", AuthMethod: AuthMethodVaultJWT, JWT: "j"},
++			wantErr: "requires a Vault role",
++		},
++		{
++			name:    "jwt auth without a token",
++			cfg:     Config{URL: "https://v.example.com/v1/transit/sign/k", AuthMethod: AuthMethodVaultJWT, Role: "r"},
++			wantErr: "workload identity token",
++		},
++		{
++			name:    "approle without a secret id",
++			cfg:     Config{URL: "https://v.example.com/v1/transit/sign/k", AuthMethod: AuthMethodVaultAppRole, RoleID: "r"},
++			wantErr: "requires a role ID and a secret ID",
++		},
++		{
++			name:    "token auth without a token",
++			cfg:     Config{URL: "https://v.example.com/v1/transit/sign/k", AuthMethod: AuthMethodToken},
++			wantErr: "requires a token",
++		},
++		{
++			name:    "unknown auth method",
++			cfg:     Config{URL: "https://v.example.com/v1/transit/sign/k", AuthMethod: "kerberos"},
++			wantErr: "unsupported signing auth method",
++		},
++		{
++			name:    "login without a derivable address",
++			cfg:     Config{URL: "https://gateway.example.com/sign", Mode: ModeVaultTransit, AuthMethod: AuthMethodVaultJWT, Role: "r", JWT: "j"},
++			wantErr: "cannot derive the Vault address",
++		},
++		{
++			name:    "relative URL",
++			cfg:     Config{URL: "vault.example.com/v1/transit/sign/k"},
++			wantErr: "absolute http(s) URL",
++		},
++		{
++			name:    "unknown mode",
++			cfg:     Config{URL: "https://v.example.com/sign", Mode: "grpc"},
++			wantErr: "unsupported signing mode",
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := New(tc.cfg)
++			if err == nil {
++				t.Fatal("expected a configuration error")
++			}
++			if !strings.Contains(err.Error(), tc.wantErr) {
++				t.Errorf("error %q does not contain %q", err, tc.wantErr)
++			}
++		})
++	}
++}
++
++func TestModeAndAuthMethodInference(t *testing.T) {
++	if got := (Config{URL: "https://v.example.com/v1/transit/sign/key"}).resolveMode(); got != ModeVaultTransit {
++		t.Errorf("mode = %q, want %q for a Transit sign URL", got, ModeVaultTransit)
++	}
++	if got := (Config{URL: "https://kms.example.com/sign"}).resolveMode(); got != ModeHTTP {
++		t.Errorf("mode = %q, want %q for a generic URL", got, ModeHTTP)
++	}
++	if got := (Config{URL: "https://v/v1/x/sign/k", Mode: ModeHTTP}).resolveMode(); got != ModeHTTP {
++		t.Error("an explicit mode must win over inference")
++	}
++
++	cases := []struct {
++		cfg  Config
++		want string
++	}{
++		{Config{Token: "t"}, AuthMethodToken},
++		{Config{Role: "r", JWTTokenFile: "/f"}, AuthMethodVaultJWT},
++		{Config{RoleID: "r", SecretID: "s"}, AuthMethodVaultAppRole},
++		{Config{}, AuthMethodNone},
++		{Config{Token: "t", AuthMethod: AuthMethodNone}, AuthMethodNone},
++	}
++	for _, tc := range cases {
++		if got := tc.cfg.resolveAuthMethod(); got != tc.want {
++			t.Errorf("resolveAuthMethod(%+v) = %q, want %q", tc.cfg, got, tc.want)
++		}
++	}
++}
++
++func TestSignerHonoursContextCancellation(t *testing.T) {
++	vault := newVaultServer(t)
++	signer, err := New(Config{URL: vault.SignURL(), Token: "t"})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if _, err := signer.Sign(ctx, []byte("header.payload")); err == nil {
++		t.Fatal("expected an error for a cancelled context")
++	}
++}
++
++func TestCustomHeadersReachTheSigningService(t *testing.T) {
++	vault := newVaultServer(t)
++	signer, err := New(Config{
++		URL:     vault.SignURL(),
++		Token:   "t",
++		Headers: map[string]string{"X-Request-Source": "terraform"},
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	if _, err := signer.Sign(context.Background(), []byte("header.payload")); err != nil {
++		t.Fatalf("Sign: %v", err)
++	}
++	_, headers, _ := vault.snapshot()
++	if got := headers[0].Get("X-Request-Source"); got != "terraform" {
++		t.Errorf("X-Request-Source = %q, want terraform", got)
++	}
++}
++
++var _ = http.MethodPost

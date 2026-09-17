@@ -1,0 +1,622 @@
+diff --git a/docs/index.md b/docs/index.md
+index 9bff4e4..7a49312 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -102,6 +102,68 @@ provider "zia" {
+ 
+ For the resources and data sources examples, please check the [examples](https://github.com/zscaler/terraform-provider-zia/tree/master/examples) directory.
+ 
++## Examples Usage - Remote Signing Service Authentication
++
++Private key authentication can also be used **without giving the provider the private key**. The
++OAuth2 client assertion is assembled by the provider and sent to a signing service - HashiCorp/HCP
++Vault Transit, a cloud KMS, or any HTTP signing endpoint - which returns the signature. The private
++key never leaves the key store, so it can be generated as non-exportable.
++
++```hcl
++# Configure the zia Provider (OneAPI Authentication) - Remote Signing Service
++#
++# NOTE: `signing_url` conflicts with both `private_key` and `client_secret`.
++provider "zia" {
++  client_id     = "[ZSCALER_CLIENT_ID]"
++  vanity_domain = "[ZSCALER_VANITY_DOMAIN]"
++  # HCP Vault Dedicated / Vault Enterprise Transit engine
++  signing_url             = "https://[CLUSTER].[REGION].hashicorp.cloud:8200/v1/transit/sign/zscaler-oneapi"
++  signing_vault_namespace = "admin"
++
++  # Workload identity: no static Vault token is stored anywhere
++  signing_auth_method    = "vault_jwt"
++  signing_vault_role     = "zscaler-terraform"
++  signing_jwt_token_file = "/var/run/secrets/tokens/vault-token"
++}
++```
++
++The Transit key must be an RSA key (`rsa-2048`, `rsa-3072` or `rsa-4096`) whose public key is
++registered on the Zscaler API client, and the Vault role must be allowed to call
++`transit/sign/<key>`. Zscaler only accepts `RS256`, so the provider always asks for
++`signature_algorithm=pkcs1v15` with `hash_algorithm=sha2-256`.
++
++### Signing service arguments
++
++| Argument                    | Description                                                                                                      | Environment Variable                                        |
++|-----------------------------|------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------|
++| `signing_url`               | _(String)_ Signing endpoint that signs the client assertion. Conflicts with `private_key` and `client_secret`.     | `ZSCALER_SIGNING_URL`                                       |
++| `signing_mode`              | _(String)_ `vault_transit` or `http`. Inferred from `signing_url` when omitted.                                    | `ZSCALER_SIGNING_MODE`                                      |
++| `signing_key_id`            | _(String)_ Value of the `kid` header of the generated assertion.                                                   | `ZSCALER_SIGNING_KEY_ID`                                    |
++| `signing_auth_method`       | _(String)_ `none`, `token`, `vault_jwt` or `vault_approle`. Inferred from the other attributes when omitted.        | `ZSCALER_SIGNING_AUTH_METHOD`                               |
++| `signing_token`             | _(String, sensitive)_ Static credential for the signing service (`X-Vault-Token`, or a bearer token in `http` mode).| `ZSCALER_SIGNING_TOKEN`, `VAULT_TOKEN`                      |
++| `signing_auth_mount`        | _(String)_ Vault auth mount used to log in (`jwt` by default, `approle` for AppRole, `kubernetes` for Kubernetes).  | `ZSCALER_SIGNING_AUTH_MOUNT`                                |
++| `signing_vault_role`        | _(String)_ Vault role used with workload identity or AppRole login.                                                 | `ZSCALER_SIGNING_ROLE`, `VAULT_ROLE`                        |
++| `signing_jwt_token_file`    | _(String)_ Path to the workload identity token, re-read on every login.                                             | `ZSCALER_SIGNING_JWT_TOKEN_FILE`, `VAULT_JWT_TOKEN_FILE`    |
++| `signing_jwt`               | _(String, sensitive)_ Workload identity token given inline instead of by path.                                      | `ZSCALER_SIGNING_JWT`                                       |
++| `signing_role_id`           | _(String, sensitive)_ Vault AppRole role ID.                                                                        | `ZSCALER_SIGNING_ROLE_ID`, `VAULT_ROLE_ID`                  |
++| `signing_secret_id`         | _(String, sensitive)_ Vault AppRole secret ID.                                                                      | `ZSCALER_SIGNING_SECRET_ID`, `VAULT_SECRET_ID`              |
++| `signing_vault_namespace`   | _(String)_ Vault namespace (`admin` on HCP Vault Dedicated).                                                        | `ZSCALER_SIGNING_NAMESPACE`, `VAULT_NAMESPACE`              |
++| `signing_vault_address`     | _(String)_ Vault base address for login calls. Derived from `signing_url` when omitted.                             | `ZSCALER_SIGNING_VAULT_ADDRESS`, `VAULT_ADDR`               |
++| `signing_vault_key_version` | _(Integer)_ Pins the Transit key version. Defaults to the latest.                                                   | `ZSCALER_SIGNING_KEY_VERSION`                               |
++| `signing_request_format`    | _(String)_ `generic` (default) or `azure_keyvault`, in `http` mode.                                                 | `ZSCALER_SIGNING_REQUEST_FORMAT`                            |
++| `signing_response_format`   | _(String)_ `signature` (default) or `jwt` for a service that mints the whole assertion, in `http` mode.              | `ZSCALER_SIGNING_RESPONSE_FORMAT`                           |
++| `signing_signature_field`   | _(String)_ Dotted path to the signature in the response, e.g. `data.signature`. Detected automatically when omitted. | `ZSCALER_SIGNING_SIGNATURE_FIELD`                           |
++| `signing_headers`           | _(Map)_ Extra HTTP headers sent to the signing service.                                                             | -                                                           |
++| `signing_request_timeout`   | _(Integer)_ Timeout in seconds for a single signing call. Defaults to 30.                                           | `ZSCALER_SIGNING_REQUEST_TIMEOUT`                           |
++
++### Other signing services
++
++Any endpoint that signs a SHA-256 digest with RSA PKCS#1 v1.5 works. In `http` mode the provider
++POSTs `{"alg":"RS256","key_id":...,"signing_input":...,"digest":...,"digest_algorithm":"SHA-256"}`
++(both values base64url encoded) and reads the signature from `signature`, `data.signature`, `value`
++or `result`, accepting base64, base64url or hex. `signing_request_format = "azure_keyvault"` posts
++the `{"alg":"RS256","value":"<digest>"}` body that Azure Key Vault and Managed HSM expect.
++
+ ## Authentication - OneAPI New Framework
+ 
+ As of version v4.0.0, this provider supports authentication via the new Zscaler API framework [OneAPI](https://help.zscaler.com/oneapi/understanding-oneapi)
+@@ -119,6 +181,7 @@ You can provide credentials via the `ZSCALER_CLIENT_ID`, `ZSCALER_CLIENT_SECRET`
+ | `client_id`     | _(String)_ Zscaler API Client ID, used with `clientSecret` or `PrivateKey` OAuth auth mode.         | `ZSCALER_CLIENT_ID`      |
+ | `client_secret` | _(String)_ Secret key associated with the API Client ID for authentication.                         | `ZSCALER_CLIENT_SECRET`  |
+ | `privateKey`    | _(String)_ A string Private key value.                                                              | `ZSCALER_PRIVATE_KEY`    |
++| `signing_url`   | _(String)_ Signing service that signs the client assertion instead of a local private key.           | `ZSCALER_SIGNING_URL`    |
+ | `vanity_domain` | _(String)_ Refers to the domain name used by your organization.                                     | `ZSCALER_VANITY_DOMAIN`  |
+ | `zscaler_cloud`         | _(String)_ The name of the Zidentity cloud, e.g., beta.                                             | `ZSCALER_CLOUD`          |
+ 
+diff --git a/zia/config.go b/zia/config.go
+index faeaa71..6d8f869 100644
+--- a/zia/config.go
++++ b/zia/config.go
+@@ -16,19 +16,23 @@ import (
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+ 	"github.com/zscaler/terraform-provider-zia/v4/zia/common"
+ 	"github.com/zscaler/zscaler-sdk-go/v3/zscaler"
++	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/remotesign"
+ 	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/zia"
+ )
+ 
+ type (
+ 	// Config contains our provider schema values and Zscaler clients.
+ 	Config struct {
+-		clientID        string
+-		clientSecret    string
+-		vanityDomain    string
+-		cloud           string
+-		sandboxToken    string
+-		sandboxCloud    string
+-		privateKey      string
++		clientID     string
++		clientSecret string
++		vanityDomain string
++		cloud        string
++		sandboxToken string
++		sandboxCloud string
++		privateKey   string
++		// signing delegates the client assertion signature to a remote signing
++		// service instead of using a locally held private key.
++		signing         remotesign.Config
+ 		httpProxy       string
+ 		retryCount      int
+ 		backoff         bool
+@@ -118,6 +122,8 @@ func NewConfig(d *schema.ResourceData) *Config {
+ 		config.privateKey = os.Getenv("ZSCALER_PRIVATE_KEY")
+ 	}
+ 
++	config.signing = signingConfigFromResourceData(d)
++
+ 	if val, ok := d.GetOk("vanity_domain"); ok {
+ 		config.vanityDomain = val.(string)
+ 	}
+@@ -384,7 +390,7 @@ func zscalerSDKV3Client(c *Config) (*zscaler.Client, error) {
+ 	}
+ 
+ 	// Handle Sandbox-only authentication
+-	if c.sandboxToken != "" && c.sandboxCloud != "" && c.clientID == "" && c.clientSecret == "" && c.privateKey == "" {
++	if c.sandboxToken != "" && c.sandboxCloud != "" && c.clientID == "" && c.clientSecret == "" && c.privateKey == "" && !c.signing.IsConfigured() {
+ 		setters = append(setters,
+ 			zscaler.WithSandboxToken(c.sandboxToken),
+ 			zscaler.WithSandboxCloud(c.sandboxCloud),
+@@ -435,8 +441,24 @@ func zscalerSDKV3Client(c *Config) (*zscaler.Client, error) {
+ 			setters = append(setters, zscaler.WithZscalerCloud(c.cloud))
+ 		}
+ 
++	// The client assertion is signed by a remote signing service, so no
++	// private key is ever handled by the provider.
++	case c.clientID != "" && c.signing.IsConfigured() && c.vanityDomain != "":
++		setters = append(setters,
++			zscaler.WithClientID(c.clientID),
++			zscaler.WithSigningConfig(c.signing),
++			zscaler.WithVanityDomain(c.vanityDomain),
++			zscaler.WithSandboxToken(c.sandboxToken),
++			zscaler.WithSandboxCloud(c.sandboxCloud),
++		)
++
++		if c.cloud != "" {
++			setters = append(setters, zscaler.WithZscalerCloud(c.cloud))
++		}
++
+ 	default:
+-		return nil, fmt.Errorf("invalid authentication configuration: missing required parameters")
++		return nil, fmt.Errorf("invalid authentication configuration: missing required parameters. " +
++			"Set client_id and vanity_domain together with one of client_secret, private_key or signing_url")
+ 	}
+ 
+ 	// Create configuration for OAuth2 authentication
+@@ -458,7 +480,7 @@ func zscalerSDKV3Client(c *Config) (*zscaler.Client, error) {
+ 
+ func (c *Config) Client() (*Client, error) {
+ 	// Handle Sandbox-only credentials
+-	if c.sandboxToken != "" && c.sandboxCloud != "" && c.clientID == "" && c.clientSecret == "" && c.privateKey == "" {
++	if c.sandboxToken != "" && c.sandboxCloud != "" && c.clientID == "" && c.clientSecret == "" && c.privateKey == "" && !c.signing.IsConfigured() {
+ 		v3Client, err := zscalerSDKV3Client(c)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to initialize Sandbox client: %w", err)
+diff --git a/zia/provider.go b/zia/provider.go
+index e2a071a..3ac2cf6 100644
+--- a/zia/provider.go
++++ b/zia/provider.go
+@@ -24,14 +24,14 @@ func ZIAProvider() *schema.Provider {
+ 				Optional:      true,
+ 				Sensitive:     true,
+ 				Description:   "zpa client secret",
+-				ConflictsWith: []string{"private_key"},
++				ConflictsWith: []string{"private_key", "signing_url"},
+ 			},
+ 			"private_key": {
+ 				Type:          schema.TypeString,
+ 				Optional:      true,
+ 				Sensitive:     true,
+ 				Description:   "zpa private key",
+-				ConflictsWith: []string{"client_secret"},
++				ConflictsWith: []string{"client_secret", "signing_url"},
+ 			},
+ 			"vanity_domain": {
+ 				Type:        schema.TypeString,
+@@ -347,6 +347,11 @@ func ZIAProvider() *schema.Provider {
+ 		guardResourceAgainstInertClient(ds)
+ 	}
+ 
++	// Remote client assertion signing, an alternative to private_key.
++	for name, attribute := range signingSchema() {
++		p.Schema[name] = attribute
++	}
++
+ 	p.ConfigureContextFunc = func(_ context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
+ 		terraformVersion := p.TerraformVersion
+ 		if terraformVersion == "" {
+diff --git a/zia/signing.go b/zia/signing.go
+new file mode 100644
+index 0000000..60e5ee4
+--- /dev/null
++++ b/zia/signing.go
+@@ -0,0 +1,234 @@
++package zia
++
++import (
++	"fmt"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
++	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/remotesign"
++)
++
++// Remote client assertion signing.
++//
++// OneAPI accepts a JWT client assertion signed by the private key of a
++// registered public key. The assertion is assembled by the provider and only
++// its signature has to be produced by the holder of the private key, so that
++// signature can be delegated to the key store that generated the key: Vault
++// Transit, a cloud KMS, or any HTTP signing endpoint. The provider then never
++// needs the raw key, which means the key never has to be created as exportable.
++//
++// These attributes are shared verbatim by the ZIA and ZPA providers.
++
++// signingSchema returns the provider attributes that configure remote signing.
++func signingSchema() map[string]*schema.Schema {
++	return map[string]*schema.Schema{
++		"signing_url": {
++			Type:          schema.TypeString,
++			Optional:      true,
++			ConflictsWith: []string{"private_key", "client_secret"},
++			Description: "URL of the signing service that signs the OAuth2 client assertion, for example a Vault Transit sign endpoint " +
++				"(https://vault.example.com/v1/transit/sign/zscaler-oneapi). Used instead of `private_key` so the private key never " +
++				"leaves the key store. Can also be sourced from `ZSCALER_SIGNING_URL`.",
++		},
++		"signing_mode": {
++			Type:         schema.TypeString,
++			Optional:     true,
++			ValidateFunc: validateSigningValue("signing_mode", remotesign.ModeVaultTransit, remotesign.ModeHTTP),
++			Description: "Protocol spoken to the signing service: `vault_transit` or `http`. Inferred from `signing_url` when omitted. " +
++				"Can also be sourced from `ZSCALER_SIGNING_MODE`.",
++		},
++		"signing_key_id": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Value of the `kid` header of the generated client assertion. Only needed when the Zscaler tenant has several " +
++				"registered public keys. Can also be sourced from `ZSCALER_SIGNING_KEY_ID`.",
++		},
++		"signing_token": {
++			Type:      schema.TypeString,
++			Optional:  true,
++			Sensitive: true,
++			Description: "Static credential presented to the signing service: an `X-Vault-Token` in `vault_transit` mode, a bearer token " +
++				"in `http` mode. Can also be sourced from `ZSCALER_SIGNING_TOKEN` or `VAULT_TOKEN`.",
++		},
++		"signing_auth_method": {
++			Type:     schema.TypeString,
++			Optional: true,
++			ValidateFunc: validateSigningValue("signing_auth_method",
++				remotesign.AuthMethodNone, remotesign.AuthMethodToken, remotesign.AuthMethodVaultJWT, remotesign.AuthMethodVaultAppRole),
++			Description: "How to authenticate to the signing service: `none`, `token`, `vault_jwt` (workload identity) or `vault_approle`. " +
++				"Inferred from the other signing attributes when omitted. Can also be sourced from `ZSCALER_SIGNING_AUTH_METHOD`.",
++		},
++		"signing_auth_mount": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Vault auth mount path used to log in, defaulting to `jwt` for `vault_jwt` and `approle` for `vault_approle`. " +
++				"Set it to `kubernetes` to log in through the Kubernetes auth method. Can also be sourced from `ZSCALER_SIGNING_AUTH_MOUNT`.",
++		},
++		"signing_vault_role": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Vault role to log in as when using workload identity or AppRole authentication. Can also be sourced from " +
++				"`ZSCALER_SIGNING_ROLE` or `VAULT_ROLE`.",
++		},
++		"signing_jwt": {
++			Type:      schema.TypeString,
++			Optional:  true,
++			Sensitive: true,
++			Description: "Workload identity token presented to the Vault JWT/OIDC auth method. Prefer `signing_jwt_token_file` for " +
++				"rotating tokens. Can also be sourced from `ZSCALER_SIGNING_JWT`.",
++		},
++		"signing_jwt_token_file": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Path to the workload identity token presented to the Vault JWT/OIDC auth method, for example the projected " +
++				"service account token of the pod running Terraform. It is re-read on every login so rotated tokens keep working. " +
++				"Can also be sourced from `ZSCALER_SIGNING_JWT_TOKEN_FILE` or `VAULT_JWT_TOKEN_FILE`.",
++		},
++		"signing_role_id": {
++			Type:        schema.TypeString,
++			Optional:    true,
++			Sensitive:   true,
++			Description: "Vault AppRole role ID. Can also be sourced from `ZSCALER_SIGNING_ROLE_ID` or `VAULT_ROLE_ID`.",
++		},
++		"signing_secret_id": {
++			Type:        schema.TypeString,
++			Optional:    true,
++			Sensitive:   true,
++			Description: "Vault AppRole secret ID. Can also be sourced from `ZSCALER_SIGNING_SECRET_ID` or `VAULT_SECRET_ID`.",
++		},
++		"signing_vault_namespace": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Vault namespace sent as `X-Vault-Namespace`. HCP Vault Dedicated clusters normally need `admin`. " +
++				"Can also be sourced from `ZSCALER_SIGNING_NAMESPACE` or `VAULT_NAMESPACE`.",
++		},
++		"signing_vault_address": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Base address of the Vault cluster used for login calls. Derived from `signing_url` when omitted. " +
++				"Can also be sourced from `ZSCALER_SIGNING_VAULT_ADDRESS` or `VAULT_ADDR`.",
++		},
++		"signing_vault_key_version": {
++			Type:     schema.TypeInt,
++			Optional: true,
++			Description: "Pins the Vault Transit key version used to sign. Defaults to the latest version. Can also be sourced from " +
++				"`ZSCALER_SIGNING_KEY_VERSION`.",
++		},
++		"signing_request_format": {
++			Type:         schema.TypeString,
++			Optional:     true,
++			ValidateFunc: validateSigningValue("signing_request_format", remotesign.RequestFormatGeneric, remotesign.RequestFormatAzureKeyVault),
++			Description: "Request body shape in `http` mode: `generic` or `azure_keyvault`. Can also be sourced from " +
++				"`ZSCALER_SIGNING_REQUEST_FORMAT`.",
++		},
++		"signing_response_format": {
++			Type:         schema.TypeString,
++			Optional:     true,
++			ValidateFunc: validateSigningValue("signing_response_format", remotesign.ResponseFormatSignature, remotesign.ResponseFormatJWT),
++			Description: "What the signing service returns in `http` mode: `signature` (default) or `jwt`, for a service that mints the " +
++				"whole assertion. Can also be sourced from `ZSCALER_SIGNING_RESPONSE_FORMAT`.",
++		},
++		"signing_signature_field": {
++			Type:     schema.TypeString,
++			Optional: true,
++			Description: "Dotted path to the signature in the signing response, for example `data.signature`. Detected automatically when " +
++				"omitted. Can also be sourced from `ZSCALER_SIGNING_SIGNATURE_FIELD`.",
++		},
++		"signing_headers": {
++			Type:        schema.TypeMap,
++			Optional:    true,
++			Elem:        &schema.Schema{Type: schema.TypeString},
++			Description: "Extra HTTP headers sent to the signing service.",
++		},
++		"signing_request_timeout": {
++			Type:        schema.TypeInt,
++			Optional:    true,
++			Description: "Timeout in seconds for a single call to the signing service. Defaults to 30. Can also be sourced from `ZSCALER_SIGNING_REQUEST_TIMEOUT`.",
++		},
++	}
++}
++
++// validateSigningValue accepts only the listed values, case-insensitively.
++func validateSigningValue(attribute string, allowed ...string) schema.SchemaValidateFunc {
++	return func(value interface{}, _ string) ([]string, []error) {
++		given, ok := value.(string)
++		if !ok || given == "" {
++			return nil, nil
++		}
++		for _, candidate := range allowed {
++			if strings.EqualFold(given, candidate) {
++				return nil, nil
++			}
++		}
++		return nil, []error{fmt.Errorf("%s must be one of %s, got %q", attribute, strings.Join(allowed, ", "), given)}
++	}
++}
++
++// signingConfigFromResourceData reads the signing attributes, falling back to
++// the documented environment variables.
++func signingConfigFromResourceData(d *schema.ResourceData) remotesign.Config {
++	str := func(attribute string, envNames ...string) string {
++		if val, ok := d.GetOk(attribute); ok {
++			if value, ok := val.(string); ok && value != "" {
++				return value
++			}
++		}
++		for _, name := range envNames {
++			if value := os.Getenv(name); value != "" {
++				return value
++			}
++		}
++		return ""
++	}
++	integer := func(attribute string, envNames ...string) int {
++		if val, ok := d.GetOk(attribute); ok {
++			if value, ok := val.(int); ok && value != 0 {
++				return value
++			}
++		}
++		for _, name := range envNames {
++			if raw := os.Getenv(name); raw != "" {
++				if value, err := strconv.Atoi(raw); err == nil {
++					return value
++				}
++			}
++		}
++		return 0
++	}
++
++	config := remotesign.Config{
++		URL:            str("signing_url", "ZSCALER_SIGNING_URL"),
++		Mode:           str("signing_mode", "ZSCALER_SIGNING_MODE"),
++		KeyID:          str("signing_key_id", "ZSCALER_SIGNING_KEY_ID"),
++		Token:          str("signing_token", "ZSCALER_SIGNING_TOKEN", "VAULT_TOKEN"),
++		AuthMethod:     str("signing_auth_method", "ZSCALER_SIGNING_AUTH_METHOD"),
++		AuthMount:      str("signing_auth_mount", "ZSCALER_SIGNING_AUTH_MOUNT"),
++		Role:           str("signing_vault_role", "ZSCALER_SIGNING_ROLE", "VAULT_ROLE"),
++		JWT:            str("signing_jwt", "ZSCALER_SIGNING_JWT"),
++		JWTTokenFile:   str("signing_jwt_token_file", "ZSCALER_SIGNING_JWT_TOKEN_FILE", "VAULT_JWT_TOKEN_FILE"),
++		RoleID:         str("signing_role_id", "ZSCALER_SIGNING_ROLE_ID", "VAULT_ROLE_ID"),
++		SecretID:       str("signing_secret_id", "ZSCALER_SIGNING_SECRET_ID", "VAULT_SECRET_ID"),
++		Namespace:      str("signing_vault_namespace", "ZSCALER_SIGNING_NAMESPACE", "VAULT_NAMESPACE"),
++		VaultAddress:   str("signing_vault_address", "ZSCALER_SIGNING_VAULT_ADDRESS", "VAULT_ADDR"),
++		KeyVersion:     integer("signing_vault_key_version", "ZSCALER_SIGNING_KEY_VERSION"),
++		RequestFormat:  str("signing_request_format", "ZSCALER_SIGNING_REQUEST_FORMAT"),
++		ResponseFormat: str("signing_response_format", "ZSCALER_SIGNING_RESPONSE_FORMAT"),
++		SignatureField: str("signing_signature_field", "ZSCALER_SIGNING_SIGNATURE_FIELD"),
++	}
++
++	if seconds := integer("signing_request_timeout", "ZSCALER_SIGNING_REQUEST_TIMEOUT"); seconds > 0 {
++		config.RequestTimeout = time.Duration(seconds) * time.Second
++	}
++	if raw, ok := d.GetOk("signing_headers"); ok {
++		if headers, ok := raw.(map[string]interface{}); ok && len(headers) > 0 {
++			config.Headers = make(map[string]string, len(headers))
++			for name, value := range headers {
++				config.Headers[name] = fmt.Sprintf("%v", value)
++			}
++		}
++	}
++	return config
++}
+diff --git a/zia/signing_test.go b/zia/signing_test.go
+new file mode 100644
+index 0000000..233bfef
+--- /dev/null
++++ b/zia/signing_test.go
+@@ -0,0 +1,174 @@
++package zia
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
++	"github.com/zscaler/zscaler-sdk-go/v3/zscaler/remotesign"
++)
++
++// signingResourceData builds a ResourceData against the real provider schema.
++func signingResourceData(t *testing.T, values map[string]interface{}) *schema.ResourceData {
++	t.Helper()
++	return schema.TestResourceDataRaw(t, ZIAProvider().Schema, values)
++}
++
++func TestSigningSchemaIsRegistered(t *testing.T) {
++	providerSchema := ZIAProvider().Schema
++	for name := range signingSchema() {
++		if _, ok := providerSchema[name]; !ok {
++			t.Errorf("provider schema is missing the %q attribute", name)
++		}
++	}
++
++	// signing_url and the local credential attributes are mutually exclusive.
++	for _, attribute := range []string{"client_secret", "private_key"} {
++		conflicts := providerSchema[attribute].ConflictsWith
++		found := false
++		for _, conflict := range conflicts {
++			if conflict == "signing_url" {
++				found = true
++			}
++		}
++		if !found {
++			t.Errorf("%s does not conflict with signing_url (got %v)", attribute, conflicts)
++		}
++	}
++	if len(providerSchema["signing_url"].ConflictsWith) != 2 {
++		t.Errorf("signing_url should conflict with both client_secret and private_key, got %v", providerSchema["signing_url"].ConflictsWith)
++	}
++	if !providerSchema["signing_token"].Sensitive {
++		t.Error("signing_token must be marked sensitive")
++	}
++	for _, attribute := range []string{"signing_jwt", "signing_role_id", "signing_secret_id"} {
++		if !providerSchema[attribute].Sensitive {
++			t.Errorf("%s must be marked sensitive", attribute)
++		}
++	}
++}
++
++func TestSigningConfigFromResourceData(t *testing.T) {
++	data := signingResourceData(t, map[string]interface{}{
++		"signing_url":               "https://vault.example.com/v1/transit/sign/zscaler-oneapi",
++		"signing_mode":              remotesign.ModeVaultTransit,
++		"signing_key_id":            "key-1",
++		"signing_auth_method":       remotesign.AuthMethodVaultJWT,
++		"signing_auth_mount":        "jwt",
++		"signing_vault_role":        "zscaler-terraform",
++		"signing_jwt_token_file":    "/var/run/secrets/tokens/vault",
++		"signing_vault_namespace":   "admin",
++		"signing_vault_key_version": 2,
++		"signing_request_timeout":   15,
++		"signing_headers":           map[string]interface{}{"X-Request-Source": "terraform"},
++	})
++
++	config := signingConfigFromResourceData(data)
++	if !config.IsConfigured() {
++		t.Fatal("signing configuration was not detected")
++	}
++	if config.URL != "https://vault.example.com/v1/transit/sign/zscaler-oneapi" {
++		t.Errorf("URL = %q", config.URL)
++	}
++	if config.Role != "zscaler-terraform" || config.JWTTokenFile != "/var/run/secrets/tokens/vault" {
++		t.Errorf("workload identity settings were not mapped: %+v", config)
++	}
++	if config.Namespace != "admin" || config.KeyVersion != 2 {
++		t.Errorf("Vault settings were not mapped: %+v", config)
++	}
++	if config.RequestTimeout != 15*time.Second {
++		t.Errorf("RequestTimeout = %s, want 15s", config.RequestTimeout)
++	}
++	if config.Headers["X-Request-Source"] != "terraform" {
++		t.Errorf("headers were not mapped: %+v", config.Headers)
++	}
++
++	// The configuration must be accepted by the SDK.
++	if _, err := remotesign.New(config); err != nil {
++		t.Errorf("the SDK rejected the configuration: %v", err)
++	}
++}
++
++func TestSigningConfigFallsBackToEnvironment(t *testing.T) {
++	t.Setenv("ZSCALER_SIGNING_URL", "https://vault.example.com/v1/transit/sign/from-env")
++	t.Setenv("VAULT_TOKEN", "hvs.from-env")
++	t.Setenv("VAULT_NAMESPACE", "admin")
++	t.Setenv("VAULT_ROLE", "role-from-env")
++	t.Setenv("ZSCALER_SIGNING_KEY_VERSION", "7")
++
++	config := signingConfigFromResourceData(signingResourceData(t, map[string]interface{}{}))
++	if config.URL != "https://vault.example.com/v1/transit/sign/from-env" {
++		t.Errorf("URL = %q, want the value from ZSCALER_SIGNING_URL", config.URL)
++	}
++	if config.Token != "hvs.from-env" {
++		t.Errorf("Token = %q, want the value from VAULT_TOKEN", config.Token)
++	}
++	if config.Namespace != "admin" {
++		t.Errorf("Namespace = %q, want the value from VAULT_NAMESPACE", config.Namespace)
++	}
++	if config.Role != "role-from-env" {
++		t.Errorf("Role = %q, want the value from VAULT_ROLE", config.Role)
++	}
++	if config.KeyVersion != 7 {
++		t.Errorf("KeyVersion = %d, want 7", config.KeyVersion)
++	}
++}
++
++func TestSigningConfigPrefersExplicitValues(t *testing.T) {
++	t.Setenv("ZSCALER_SIGNING_URL", "https://vault.example.com/v1/transit/sign/from-env")
++	t.Setenv("VAULT_TOKEN", "hvs.from-env")
++
++	config := signingConfigFromResourceData(signingResourceData(t, map[string]interface{}{
++		"signing_url":   "https://vault.example.com/v1/transit/sign/explicit",
++		"signing_token": "hvs.explicit",
++	}))
++	if config.URL != "https://vault.example.com/v1/transit/sign/explicit" {
++		t.Errorf("URL = %q, want the explicitly configured value", config.URL)
++	}
++	if config.Token != "hvs.explicit" {
++		t.Errorf("Token = %q, want the explicitly configured value", config.Token)
++	}
++}
++
++func TestNoSigningConfiguration(t *testing.T) {
++	config := signingConfigFromResourceData(signingResourceData(t, map[string]interface{}{}))
++	if config.IsConfigured() {
++		t.Errorf("an empty configuration must not enable remote signing: %+v", config)
++	}
++}
++
++func TestSigningAttributeValidation(t *testing.T) {
++	providerSchema := ZIAProvider().Schema
++	cases := map[string]struct {
++		value   string
++		wantErr bool
++	}{
++		"signing_mode":            {value: "vault_transit"},
++		"signing_auth_method":     {value: "vault_jwt"},
++		"signing_request_format":  {value: "azure_keyvault"},
++		"signing_response_format": {value: "signature"},
++	}
++	for attribute, tc := range cases {
++		validate := providerSchema[attribute].ValidateFunc
++		if validate == nil {
++			t.Fatalf("%s has no validation", attribute)
++		}
++		if _, errs := validate(tc.value, attribute); len(errs) != 0 {
++			t.Errorf("%s rejected the valid value %q: %v", attribute, tc.value, errs)
++		}
++		if _, errs := validate("nonsense", attribute); len(errs) == 0 {
++			t.Errorf("%s accepted an invalid value", attribute)
++		}
++	}
++}
++
++func TestAuthenticationConfigurationErrorMentionsSigning(t *testing.T) {
++	_, err := zscalerSDKV3Client(&Config{})
++	if err == nil {
++		t.Fatal("expected an error for an empty configuration")
++	}
++	if !strings.Contains(err.Error(), "signing_url") {
++		t.Errorf("error %q does not mention signing_url as an option", err)
++	}
++}
